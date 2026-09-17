@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Local data (never commit collected usage history)
+usage.db
+usage.db.bak-*
+ingest.lock
+
+# Logs
+*.log

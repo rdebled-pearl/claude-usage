@@ -1,0 +1,6 @@
+# Dashboard dependencies (ingest.py is stdlib-only and needs none of these).
+# Pinned so installs/updates are reproducible; bump deliberately.
+anthropic==1.6.0
+pandas==3.0.5
+plotly==7.1.0
+streamlit==1.64.0

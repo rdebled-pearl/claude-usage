@@ -1,0 +1,128 @@
+#!/bin/bash
+# Opens the Claude usage dashboard in the browser, starting the local
+# Streamlit server first if it isn't already running.
+#
+# Usage:
+#   claude-usage            start the server (if needed) and open the browser
+#   claude-usage --stop     stop the running dashboard server
+#   claude-usage --status   report whether the server is running
+#   claude-usage --update   pull the latest code and reinstall
+#   claude-usage --help     show this help
+set -euo pipefail
+
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT=8501
+URL="http://localhost:${PORT}"
+
+# Resolve the mutable-state dir (logs live here, alongside usage.db).
+if [ -n "${CLAUDE_USAGE_DATA_DIR:-}" ]; then
+    DATA_DIR="${CLAUDE_USAGE_DATA_DIR/#\~/$HOME}"
+elif [ -f "$HOME/.claude-usage/usage.db" ] && [ ! -f "$HOME/.local/state/claude-usage/usage.db" ]; then
+    DATA_DIR="$HOME/.claude-usage"
+else
+    DATA_DIR="$HOME/.local/state/claude-usage"
+fi
+mkdir -p "$DATA_DIR"
+export CLAUDE_USAGE_DATA_DIR="$DATA_DIR"
+
+# Match on the launched command line (Streamlit may fork, so the PID isn't
+# reliably the port listener). Prints matching PIDs, one per line.
+server_pids() {
+    pgrep -f "${APP_DIR}/venv/bin/streamlit run dashboard.py" || true
+}
+
+is_listening() {
+    lsof -i ":${PORT}" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+case "${1:-}" in
+    --status)
+        pids="$(server_pids)"
+        if is_listening || [ -n "$pids" ]; then
+            echo "Dashboard is running on ${URL}"
+            [ -n "$pids" ] && echo "  pid(s): $(echo "$pids" | tr '\n' ' ')"
+        else
+            echo "Dashboard is not running."
+        fi
+        exit 0
+        ;;
+    --stop)
+        pids="$(server_pids)"
+        if [ -z "$pids" ]; then
+            echo "Dashboard is not running."
+            exit 0
+        fi
+        echo "Stopping dashboard (pid(s): $(echo "$pids" | tr '\n' ' ')) ..."
+        # shellcheck disable=SC2086
+        kill $pids 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            is_listening || { echo "Stopped."; exit 0; }
+            sleep 0.25
+        done
+        pids="$(server_pids)"
+        if [ -n "$pids" ]; then
+            # shellcheck disable=SC2086
+            kill -9 $pids 2>/dev/null || true
+            sleep 0.5
+        fi
+        if is_listening; then
+            echo "Warning: something is still listening on port ${PORT}." >&2
+            exit 1
+        fi
+        echo "Stopped."
+        exit 0
+        ;;
+    --update)
+        # Original source checkout path, recorded at install time.
+        src_file="${APP_DIR}/.source"
+        if [ ! -f "$src_file" ]; then
+            echo "Can't self-update: no ${src_file} recorded." >&2
+            echo "Re-run install.sh from your source checkout instead." >&2
+            exit 1
+        fi
+        src="$(cat "$src_file")"
+        if [ ! -d "$src" ]; then
+            echo "Recorded source checkout is gone: ${src}" >&2
+            echo "Re-clone it and re-run install.sh." >&2
+            exit 1
+        fi
+        echo "==> Updating from ${src}"
+        if [ -d "${src}/.git" ]; then
+            echo "    git pull..."
+            git -C "$src" pull --ff-only
+        else
+            echo "    (${src} is not a git checkout; reinstalling current contents)"
+        fi
+        echo "    running installer (non-interactively)..."
+        "${src}/install.sh" </dev/null
+        echo "==> Update complete. Run 'claude-usage' to reopen the dashboard."
+        exit 0
+        ;;
+    --help|-h)
+        sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    "")
+        ;;  # fall through to start-and-open
+    *)
+        echo "Unknown option: $1" >&2
+        echo "Try 'claude-usage --help'." >&2
+        exit 2
+        ;;
+esac
+
+if ! is_listening; then
+    echo "Starting Claude usage dashboard on ${URL} ..."
+    cd "$APP_DIR"
+    nohup ./run_dashboard.sh >>"${DATA_DIR}/dashboard.log" 2>&1 &
+    disown
+
+    for _ in $(seq 1 30); do
+        if is_listening; then
+            break
+        fi
+        sleep 0.5
+    done
+fi
+
+open "$URL"
