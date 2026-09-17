@@ -8,6 +8,7 @@ venv/
 usage.db
 usage.db.bak-*
 ingest.lock
+ingest.progress
 
 # Logs
 *.log

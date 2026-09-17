@@ -1,7 +1,11 @@
 import datetime as dt
+import fcntl
 import json
 import os
 import sqlite3
+import subprocess
+import sys
+import time
 
 import pandas as pd
 import plotly.express as px
@@ -24,6 +28,9 @@ def _data_dir():
 
 
 DB_PATH = os.path.join(_data_dir(), "usage.db")
+LOCK_PATH = os.path.join(_data_dir(), "ingest.lock")
+PROGRESS_PATH = os.path.join(_data_dir(), "ingest.progress")
+INGEST_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ingest.py")
 
 _LIGHT = dict(
     surface="#ffffff",
@@ -74,7 +81,19 @@ STATUS_WARNING = "#fab219"
 STATUS_SERIOUS = "#ec835a"
 STATUS_CRITICAL = "#d03b3b"
 
-st.set_page_config(page_title="Claude Code Usage", layout="wide")
+st.set_page_config(
+    page_title="Claude Code Usage",
+    layout="wide",
+    menu_items={
+        "Get Help": "https://github.com/rdebled-pearl/claude-usage",
+        "Report a bug": "https://github.com/rdebled-pearl/claude-usage/issues",
+        "About": (
+            "**Claude Code usage dashboard** \u2014 a local, single-user tool "
+            "for token/cost analytics over your Claude Code sessions.\n\n"
+            "[Source on GitHub](https://github.com/rdebled-pearl/claude-usage)"
+        ),
+    },
+)
 
 
 def resolve_theme_type():
@@ -1448,14 +1467,294 @@ def tab_trends(df):
     render_session_pacing(df)
 
 
+# --- First-run ingest / rebuild orchestration -------------------------------
+#
+# Ingest is normally run on a schedule by launchd, but on a fresh install the
+# database is empty (or absent) until that first run happens. Rather than show a
+# bare error, the dashboard kicks off ingest itself and plays a build animation
+# until it completes. The same path backs the sidebar "Purge & rebuild" action.
+
+INGEST_MESSAGES = [
+    "Scanning Claude Code transcripts\u2026",
+    "Parsing token usage\u2026",
+    "Pricing sessions against the rate card\u2026",
+    "Resolving pull requests\u2026",
+    "Assembling charts and trends\u2026",
+]
+
+
+def _db_has_rows():
+    """True only if usage_events exists AND holds at least one row. A file can
+    exist with the schema but no data mid-first-ingest."""
+    if not os.path.exists(DB_PATH):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        row = conn.execute("SELECT 1 FROM usage_events LIMIT 1").fetchone()
+        conn.close()
+        return row is not None
+    except sqlite3.Error:
+        return False
+
+
+def _ingest_in_progress():
+    """True if some other process holds the ingest lock (e.g. a scheduled run,
+    or an ingest we launched that survived a browser refresh). Probing the
+    advisory flock is how we detect it without a PID handle."""
+    if not os.path.exists(LOCK_PATH):
+        return False
+    try:
+        fd = open(LOCK_PATH, "r+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fd.close()
+
+
+def _read_progress():
+    """(fraction, label) from ingest's progress file, or None if unavailable."""
+    try:
+        with open(PROGRESS_PATH) as fh:
+            data = json.load(fh)
+        return float(data.get("fraction", 0.0)), str(data.get("label", ""))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _start_ingest():
+    """Launch ingest.py as a detached subprocess pointed at our data dir."""
+    # Clear any stale progress so we don't briefly show the last run's 100%.
+    try:
+        os.remove(PROGRESS_PATH)
+    except OSError:
+        pass
+    env = dict(os.environ)
+    env["CLAUDE_USAGE_DATA_DIR"] = os.path.dirname(DB_PATH)
+    proc = subprocess.Popen(
+        [sys.executable, INGEST_SCRIPT],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    st.session_state["ingest_started"] = time.time()
+    return proc
+
+
+def _build_animation_html():
+    """An abstract SVG of a dashboard being constructed: data blocks feed in
+    along a track, bars rise from the baseline, a trend line draws across their
+    tops, and a scan beam sweeps the frame. Pure CSS/SVG, loops forever."""
+    bars = "".join(
+        f'<rect class="ib-bar" x="{x}" y="{190 - h}" width="34" height="{h}" rx="5" '
+        f'fill="url(#ibBar)" style="animation-delay:{d}s"/>'
+        for x, h, d in [
+            (60, 70, 0.0), (120, 110, 0.15), (180, 90, 0.30),
+            (240, 140, 0.45), (300, 120, 0.60), (360, 160, 0.75),
+        ]
+    )
+    nodes = "".join(
+        f'<circle class="ib-node" cx="{cx}" cy="{cy}" r="4" fill="{ACCENT_MAGENTA}" '
+        f'style="animation-delay:{d}s"/>'
+        for cx, cy, d in [
+            (77, 120, 0.3), (137, 80, 0.6), (197, 100, 0.9),
+            (257, 50, 1.2), (317, 70, 1.5), (377, 30, 1.8),
+        ]
+    )
+    feed = "".join(
+        f'<rect class="ib-feed" x="0" y="{y}" width="22" height="22" rx="5" '
+        f'fill="{ACCENT}" style="animation-delay:{d}s"/>'
+        for y, d in [(30, 0.0), (30, 0.95), (30, 1.9)]
+    )
+    return f"""
+    <style>
+    .ingest-stage {{ display:flex; justify-content:center; padding:1.4rem 0 0.4rem; }}
+    .ingest-stage svg {{ width:min(540px,92%); height:auto; }}
+    .ib-grid {{ stroke:{GRIDLINE}; stroke-width:1.2; stroke-dasharray:480;
+                stroke-dashoffset:480; animation:ibGrid 1.6s ease forwards; }}
+    @keyframes ibGrid {{ to {{ stroke-dashoffset:0; }} }}
+    .ib-bar {{ transform-box:fill-box; transform-origin:50% 100%;
+               animation:ibGrow 2.2s cubic-bezier(.5,0,.2,1) infinite alternate; }}
+    @keyframes ibGrow {{ 0% {{ transform:scaleY(.12); opacity:.5; }}
+                         100% {{ transform:scaleY(1); opacity:1; }} }}
+    .ib-line {{ fill:none; stroke:{ACCENT_MAGENTA}; stroke-width:2.5;
+                stroke-linecap:round; stroke-linejoin:round; stroke-dasharray:720;
+                stroke-dashoffset:720; animation:ibDraw 3.6s ease-in-out infinite; }}
+    @keyframes ibDraw {{ 0% {{ stroke-dashoffset:720; }} 55% {{ stroke-dashoffset:0; }}
+                         85% {{ stroke-dashoffset:0; }} 100% {{ stroke-dashoffset:-720; }} }}
+    .ib-node {{ opacity:0; animation:ibPulse 3.6s ease-in-out infinite; }}
+    @keyframes ibPulse {{ 0%,42% {{ opacity:0; }} 60% {{ opacity:1; }} 100% {{ opacity:.85; }} }}
+    .ib-feed {{ animation:ibFeed 2.85s linear infinite; }}
+    @keyframes ibFeed {{ 0% {{ transform:translateX(-30px); opacity:0; }}
+                         12% {{ opacity:1; }} 80% {{ opacity:1; }}
+                         100% {{ transform:translateX(430px); opacity:0; }} }}
+    .ib-scan {{ animation:ibScan 3s ease-in-out infinite; }}
+    @keyframes ibScan {{ 0% {{ transform:translateX(0); opacity:0; }}
+                         20% {{ opacity:.45; }} 80% {{ opacity:.45; }}
+                         100% {{ transform:translateX(430px); opacity:0; }} }}
+    @media (prefers-reduced-motion: reduce) {{
+      .ib-bar,.ib-line,.ib-node,.ib-feed,.ib-scan,.ib-grid {{ animation:none; }}
+      .ib-bar {{ transform:none; }} .ib-line,.ib-node {{ stroke-dashoffset:0; opacity:1; }}
+    }}
+    </style>
+    <div class="ingest-stage">
+      <svg viewBox="0 0 440 210" role="img" aria-label="Building your dashboard">
+        <defs>
+          <linearGradient id="ibBar" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="{ACCENT}"/>
+            <stop offset="1" stop-color="{ACCENT_DEEP}"/>
+          </linearGradient>
+          <linearGradient id="ibBeam" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="{ACCENT_MAGENTA}" stop-opacity="0"/>
+            <stop offset=".5" stop-color="{ACCENT_MAGENTA}" stop-opacity=".7"/>
+            <stop offset="1" stop-color="{ACCENT_MAGENTA}" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <line class="ib-grid" x1="40" y1="190" x2="410" y2="190"/>
+        <line class="ib-grid" x1="40" y1="140" x2="410" y2="140" style="animation-delay:.2s"/>
+        <line class="ib-grid" x1="40" y1="90" x2="410" y2="90" style="animation-delay:.4s"/>
+        {feed}
+        {bars}
+        <polyline class="ib-line" points="77,120 137,80 197,100 257,50 317,70 377,30"/>
+        {nodes}
+        <rect class="ib-scan" x="0" y="20" width="46" height="175" fill="url(#ibBeam)"/>
+      </svg>
+    </div>
+    """
+
+
+def _run_ingest_with_animation(proc):
+    """Render the build animation once, then hold this Streamlit run open while
+    ingest runs, refreshing only the progress bar + elapsed line so the SVG
+    keeps animating smoothly. `proc` is our subprocess, or None when we're just
+    waiting on an ingest another process already started."""
+    st.markdown('<div class="eyebrow">Setting things up</div>', unsafe_allow_html=True)
+    st.title("Building your usage dashboard")
+    st.markdown(_build_animation_html(), unsafe_allow_html=True)
+    bar_slot = st.empty()
+    caption_slot = st.empty()
+    start = st.session_state.get("ingest_started", time.time())
+
+    def render(fraction, label, elapsed):
+        bar_slot.progress(fraction, text=label)
+        caption_slot.markdown(
+            f'<div style="text-align:center; font-family:\'IBM Plex Mono\',monospace; '
+            f'font-size:.85rem; color:{MUTED}; margin-top:.35rem;">elapsed {elapsed}s</div>',
+            unsafe_allow_html=True,
+        )
+
+    def still_running():
+        if proc is not None:
+            return proc.poll() is None
+        return _ingest_in_progress()
+
+    while still_running():
+        elapsed = int(time.time() - start)
+        prog = _read_progress()
+        if prog is not None:
+            render(prog[0], prog[1], elapsed)
+        else:
+            # Ingest hasn't written progress yet -- show an indeterminate hint.
+            message = INGEST_MESSAGES[(elapsed // 3) % len(INGEST_MESSAGES)]
+            render(0.0, message, elapsed)
+        time.sleep(0.5)
+
+    elapsed = int(time.time() - start)
+    render(1.0, "Done \u2014 loading your dashboard\u2026", elapsed)
+    st.session_state["ingest_completed"] = True
+    load_data.clear()
+    time.sleep(0.6)
+    st.rerun()
+
+
+@st.dialog("Settings")
+def _settings_dialog():
+    st.markdown("#### Data")
+    st.caption("Rebuild the database from your Claude Code transcripts if "
+               "it looks corrupted or out of date. This re-scans every "
+               "transcript from scratch and can take a while.")
+    if st.button("Purge & rebuild data", use_container_width=True, type="primary"):
+        try:
+            os.remove(DB_PATH)
+        except OSError:
+            pass
+        load_data.clear()
+        st.session_state["ingest_completed"] = False
+        st.session_state["force_ingest"] = True
+        st.rerun()
+
+
+def _render_settings_button():
+    """A gear icon pinned to the top-right corner that opens the settings
+    modal -- keeps the chrome minimal and avoids a whole sidebar for one
+    rarely-used action."""
+    st.markdown(
+        f"""
+        <style>
+        /* Hide only Streamlit's Deploy button; keep the hamburger menu. */
+        [data-testid="stAppDeployButton"] {{ display: none !important; }}
+
+        /* Sit above Streamlit's header (very high z-index) so we're not hidden.
+           Placed just below the hamburger menu so the two don't collide. */
+        .st-key-settings-gear {{
+            position: fixed; top: 3.25rem; right: 0.75rem; z-index: 999999;
+            width: auto;
+        }}
+        .st-key-settings-gear button {{
+            border-radius: 50%; width: 2.6rem; height: 2.6rem; padding: 0;
+            min-height: 0; border: 1px solid {BORDER};
+            background: {SURFACE}; color: {INK_SECONDARY} !important;
+            box-shadow: 0 1px 4px rgba(11,6,32,0.08);
+            display: inline-flex; align-items: center; justify-content: center;
+            transition: color .15s ease, border-color .15s ease, transform .15s ease;
+        }}
+        .st-key-settings-gear button:hover {{
+            color: {ACCENT} !important; border-color: {ACCENT};
+            transform: rotate(30deg);
+        }}
+        .st-key-settings-gear button p {{ color: inherit !important; }}
+        .st-key-settings-gear button [data-testid="stIconMaterial"] {{
+            font-size: 1.35rem; color: inherit !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="settings-gear"):
+        if st.button("", icon=":material/settings:", key="settings-gear-btn",
+                     help="Settings"):
+            _settings_dialog()
+
+
 def main():
     apply_theme()
     inject_css()
+
+    # (Re)build path: explicit purge request, an ingest already underway, or a
+    # fresh install with no data yet. All three land on the same animation.
+    if st.session_state.pop("force_ingest", False):
+        _run_ingest_with_animation(_start_ingest())
+        return
+    if _ingest_in_progress():
+        _run_ingest_with_animation(None)
+        return
+    if not _db_has_rows() and not st.session_state.get("ingest_completed"):
+        _run_ingest_with_animation(_start_ingest())
+        return
+
     st.markdown('<div class="eyebrow">Personal cost intelligence</div>', unsafe_allow_html=True)
     st.title("Claude Code Usage")
+    _render_settings_button()
 
-    if not os.path.exists(DB_PATH):
-        st.error(f"No database found at {DB_PATH}. Run ingest.py first.")
+    if not _db_has_rows():
+        st.info(
+            "No usage data found yet. Once you've used Claude Code, its "
+            "transcripts will be ingested here \u2014 or use **Purge & rebuild "
+            "data** from the \u2699 settings menu to try again."
+        )
         return
 
     df_all = load_data(get_db_mtime())

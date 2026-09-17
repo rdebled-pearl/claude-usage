@@ -3,11 +3,33 @@ import fcntl
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sqlite3
 import sys
 import time
 from datetime import datetime, timezone
+
+
+def _find_gh():
+    """Absolute path to the `gh` CLI. launchd runs with a minimal PATH that
+    excludes Homebrew, so relying on bare `gh` breaks scheduled ingests --
+    resolve it explicitly against PATH plus common install locations."""
+    found = shutil.which("gh")
+    if found:
+        return found
+    for candidate in (
+        "/opt/homebrew/bin/gh",
+        "/usr/local/bin/gh",
+        "/home/linuxbrew/.linuxbrew/bin/gh",
+        os.path.expanduser("~/.local/bin/gh"),
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+GH_BIN = _find_gh()
 
 def _data_dir():
     """Resolve where usage.db/locks/logs live, kept separate from the
@@ -29,6 +51,7 @@ os.makedirs(BASE_DIR, exist_ok=True)
 DB_PATH = os.path.join(BASE_DIR, "usage.db")
 LOCK_PATH = os.path.join(BASE_DIR, "ingest.lock")
 LOG_PATH = os.path.join(BASE_DIR, "ingest.log")
+PROGRESS_PATH = os.path.join(BASE_DIR, "ingest.progress")
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 PR_LOOKUP_LIMIT_PER_RUN = 50
 PR_CACHE_TTL_SECONDS = 24 * 3600
@@ -408,9 +431,11 @@ def lookup_pr(cwd, branch):
     than reconstructing owner/repo from the local path."""
     if not cwd or not os.path.isdir(cwd):
         return None, None
+    if not GH_BIN:
+        return None, None
     try:
         result = subprocess.run(
-            ["gh", "pr", "list", "--head", branch, "--json", "number,url",
+            [GH_BIN, "pr", "list", "--head", branch, "--json", "number,url",
              "--state", "all", "--limit", "1"],
             cwd=cwd, capture_output=True, text=True, timeout=15,
         )
@@ -424,14 +449,37 @@ def lookup_pr(cwd, branch):
         return None, None
 
 
-def enrich_prs(conn):
+def write_progress(fraction, label, done=False):
+    """Report ingest progress to a small JSON file the dashboard polls. Written
+    atomically (tmp + rename) so a concurrent read never sees a partial line."""
+    try:
+        tmp = PROGRESS_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(
+                {"fraction": max(0.0, min(1.0, fraction)), "label": label,
+                 "done": done, "ts": time.time()},
+                fh,
+            )
+        os.replace(tmp, PROGRESS_PATH)
+    except OSError:
+        pass
+
+
+def enrich_prs(conn, progress=None):
     now = time.time()
+    if not GH_BIN:
+        log("warning: `gh` CLI not found; skipping PR resolution")
+        return
     rows = conn.execute(
         """SELECT DISTINCT repo, branch, cwd FROM usage_events
            WHERE pr_number IS NULL AND branch IS NOT NULL AND branch != 'HEAD'"""
     ).fetchall()
+    total = len(rows) or 1
     checked = 0
-    for repo, branch, cwd in rows:
+    for idx, (repo, branch, cwd) in enumerate(rows):
+        if progress:
+            progress(0.82 + 0.18 * (idx + 1) / total,
+                     f"Resolving pull requests ({idx + 1}/{total})")
         if checked >= PR_LOOKUP_LIMIT_PER_RUN:
             break
         cache_row = conn.execute(
@@ -464,22 +512,32 @@ def main():
 
     total_inserted = 0
     files_seen = 0
-    for path in session_files():
+    sessions = list(session_files())
+    subagents = list(subagent_files())
+    total_files = len(sessions) + len(subagents) or 1
+    write_progress(0.0, "Scanning Claude Code transcripts\u2026")
+    for path in sessions:
         files_seen += 1
         total_inserted += ingest_file(conn, path)
-    for path in subagent_files():
+        write_progress(0.8 * files_seen / total_files,
+                       f"Parsing transcripts ({files_seen}/{total_files})")
+    for path in subagents:
         files_seen += 1
         meta = load_agent_meta(path)
         total_inserted += ingest_file(
             conn, path, is_subagent=True,
             agent_type=meta.get("agentType"), agent_description=meta.get("description"),
         )
+        write_progress(0.8 * files_seen / total_files,
+                       f"Parsing transcripts ({files_seen}/{total_files})")
     conn.commit()
 
-    enrich_prs(conn)
+    write_progress(0.82, "Resolving pull requests\u2026")
+    enrich_prs(conn, progress=write_progress)
     conn.commit()
     conn.close()
 
+    write_progress(1.0, "Finalizing\u2026", done=True)
     log(f"ingest complete: {files_seen} files scanned, {total_inserted} new rows")
 
 

@@ -180,6 +180,15 @@ echo
 echo "==> Scheduling the ingest job with launchd (label: ${PLIST_LABEL})."
 echo "    Runs ${INSTALL_DIR}/ingest.py every 4h, plus once now, to keep usage.db current."
 mkdir -p "$HOME/Library/LaunchAgents"
+# launchd starts jobs with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) that
+# omits Homebrew, so `gh` (used for PR resolution) wouldn't be found. Build a
+# PATH that includes wherever `gh` actually lives, plus the usual locations.
+GH_PATH="$(command -v gh || true)"
+LAUNCHD_PATH="/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [ -n "$GH_PATH" ]; then
+    LAUNCHD_PATH="$(dirname "$GH_PATH"):${LAUNCHD_PATH}"
+fi
+
 cat > "$PLIST_PATH" <<PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -196,6 +205,8 @@ cat > "$PLIST_PATH" <<PLISTEOF
     <dict>
         <key>CLAUDE_USAGE_DATA_DIR</key>
         <string>${DATA_DIR}</string>
+        <key>PATH</key>
+        <string>${LAUNCHD_PATH}</string>
     </dict>
     <key>StartInterval</key>
     <integer>14400</integer>
