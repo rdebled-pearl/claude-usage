@@ -10,7 +10,21 @@
 #   claude-usage --help     show this help
 set -euo pipefail
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve the real path of this script, following symlinks (e.g. the
+# ~/.local/bin/claude-usage symlink installed by install.sh), so APP_DIR
+# points at the actual install directory rather than the symlink's parent.
+resolve_script_path() {
+    local src="${BASH_SOURCE[0]}"
+    while [ -h "$src" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    echo "$src"
+}
+
+APP_DIR="$(cd "$(dirname "$(resolve_script_path)")/.." && pwd)"
 PORT=8501
 URL="http://localhost:${PORT}"
 
