@@ -14,6 +14,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from anthropic import Anthropic, beta_tool
 
+from ask_mcp_server import USAGE_EVENTS_SCHEMA, run_sql_query
+
 def _data_dir():
     """Resolve the usage.db location. Mirrors ingest.py's resolver."""
     env = os.environ.get("CLAUDE_USAGE_DATA_DIR")
@@ -1412,35 +1414,46 @@ def render_session_pacing(df):
 
 
 ASK_MODEL = "claude-opus-5"
-
-# Column list mirrors ingest.py's usage_events schema exactly -- keep in sync
-# if that schema changes, since this is Claude's only description of the
-# table (it never sees the DB schema directly, only this string).
-_USAGE_EVENTS_SCHEMA = """
-Table usage_events (one row per Claude Code assistant turn):
-  message_id TEXT primary key, session_id TEXT, date TEXT ('YYYY-MM-DD', local day),
-  timestamp TEXT (raw UTC ISO8601), model TEXT, repo TEXT, branch TEXT, cwd TEXT,
-  pr_number INTEGER (nullable), pr_url TEXT (nullable),
-  input_tokens INTEGER, output_tokens INTEGER,
-  cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
-  cache_creation_5m_tokens INTEGER, cache_creation_1h_tokens INTEGER,
-  thinking_tokens INTEGER,
-  input_price_per_mtok REAL, output_price_per_mtok REAL,
-  input_cost REAL, output_cost REAL, cache_write_cost REAL, cache_read_cost REAL,
-  total_cost REAL (sum of the four cost columns; the number to use for "cost" questions)
-"""
-
-_SQL_FORBIDDEN_KEYWORDS = (
-    "insert", "update", "delete", "drop", "alter", "attach", "detach",
-    "pragma", "create", "replace", "vacuum", "reindex",
-)
+ASK_TIMEOUT_SECONDS = 180
+ASK_MCP_SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ask_mcp_server.py")
+# The MCP tool as Claude Code names it: mcp__<server name>__<tool name>.
+ASK_CLI_TOOL = "mcp__usage__run_sql"
 
 
-def _read_only_connection():
-    # mode=ro is enforced by SQLite itself, independent of the string checks
-    # in run_sql below.
-    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+class AskError(Exception):
+    """A user-presentable Ask failure: what went wrong, what to do about it,
+    and (optionally) raw output for the "Technical details" expander."""
 
+    def __init__(self, title, message, hint=None, details=None):
+        super().__init__(f"{title}: {message}")
+        self.title, self.message, self.hint, self.details = title, message, hint, details
+
+    def as_dict(self):
+        return {"title": self.title, "message": self.message,
+                "hint": self.hint, "details": self.details}
+
+
+def _render_ask_error(err):
+    body = f"**{err['title']}**\n\n{err['message']}"
+    if err.get("hint"):
+        body += f"\n\n{err['hint']}"
+    st.error(body, icon=":material/error:")
+    if err.get("details"):
+        with st.expander("Technical details"):
+            st.code(err["details"], language=None)
+
+
+def _ask_system_prompt():
+    return (
+        "You are a data analyst answering questions about the user's personal Claude Code "
+        f"token-usage and cost history, stored in a local SQLite database. Today's date is "
+        f"{dt.date.today().isoformat()}.\n{USAGE_EVENTS_SCHEMA}\n"
+        "Always use the run_sql tool to answer -- never guess or estimate numbers. "
+        "Keep answers to a few sentences with concrete figures (dollars, tokens, counts)."
+    )
+
+
+# --- Backend 1: Anthropic API (preferred, needs ANTHROPIC_API_KEY) ----------
 
 @beta_tool
 def run_sql(sql: str) -> str:
@@ -1450,78 +1463,293 @@ def run_sql(sql: str) -> str:
         sql: A single SELECT (or WITH ... SELECT) statement against usage_events.
             No INSERT/UPDATE/DELETE/DDL and no multiple statements.
     """
-    normalized = sql.strip().rstrip(";")
-    if ";" in normalized:
-        return json.dumps({"error": "Only a single statement is allowed."})
-    first_word = normalized.split(None, 1)[0].lower() if normalized else ""
-    if first_word not in ("select", "with"):
-        return json.dumps({"error": "Only SELECT queries are allowed."})
-    lowered = f" {normalized.lower()} "
-    if any(f" {kw} " in lowered for kw in _SQL_FORBIDDEN_KEYWORDS):
-        return json.dumps({"error": "Only read-only SELECT queries are allowed."})
-
-    try:
-        conn = _read_only_connection()
-        cur = conn.execute(normalized)
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchmany(500)
-        conn.close()
-    except sqlite3.Error as e:
-        return json.dumps({"error": str(e)})
-
-    return json.dumps({
-        "columns": cols,
-        "rows": [list(r) for r in rows],
-        "truncated": len(rows) == 500,
-    })
+    return run_sql_query(DB_PATH, sql)
 
 
-def ask_claude(question):
+def ask_claude_api(question):
     """One-shot Q&A over usage_events via the Tool Runner. Returns (answer_text, sql_queries_run)."""
     client = Anthropic()
-    system = (
-        "You are a data analyst answering questions about the user's personal Claude Code "
-        f"token-usage and cost history, stored in a local SQLite database. Today's date is "
-        f"{dt.date.today().isoformat()}.\n{_USAGE_EVENTS_SCHEMA}\n"
-        "Always use the run_sql tool to answer -- never guess or estimate numbers. "
-        "Keep answers to a few sentences with concrete figures (dollars, tokens, counts)."
-    )
     runner = client.beta.messages.tool_runner(
         model=ASK_MODEL,
         max_tokens=4096,
         thinking={"type": "adaptive"},
-        system=system,
+        system=_ask_system_prompt(),
         tools=[run_sql],
         messages=[{"role": "user", "content": question}],
     )
 
     queries_run = []
     last = None
-    for message in runner:
-        last = message
-        for block in message.content:
-            if block.type == "tool_use" and block.name == "run_sql":
-                queries_run.append(block.input.get("sql", ""))
+    try:
+        for message in runner:
+            last = message
+            for block in message.content:
+                if block.type == "tool_use" and block.name == "run_sql":
+                    queries_run.append(block.input.get("sql", ""))
+    except Exception as e:
+        raise AskError("The Claude API request failed", str(e)) from e
 
     answer = next((b.text for b in last.content if b.type == "text"), "") if last else ""
     return answer, queries_run
 
 
+# --- Backend 2: Claude Code CLI (fallback, uses its own login) --------------
+
+def _find_claude_cli():
+    """Absolute path to the `claude` CLI, checking PATH and the usual install
+    spots (the dashboard may be started from a shell with a trimmed PATH)."""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    for candidate in (
+        os.path.expanduser("~/.claude/local/claude"),
+        os.path.expanduser("~/.local/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _claude_cli_env():
+    """Environment for spawning the CLI. Strips API credentials so it
+    authenticates with its own login (otherwise a stray key would silently be
+    billed instead), and the nested-session marker so it doesn't refuse to
+    start when the dashboard itself was launched from inside Claude Code."""
+    env = dict(os.environ)
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDECODE"):
+        env.pop(key, None)
+    return env
+
+
+_CLI_AUTH_HINT = "Run `claude auth login` in a terminal, then click **Re-check**."
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _claude_cli_status():
+    """Preflight: is the CLI installed and logged in? Returns
+    ("ok", status_dict) or ("error", AskError.as_dict()). Cached briefly so it
+    isn't re-run on every rerun; only reads local credentials (no API call)."""
+    cli = _find_claude_cli()
+    if cli is None:
+        return "error", AskError(
+            "Claude Code CLI not found",
+            "Without an API key, Ask answers through the Claude Code CLI, but "
+            "no `claude` executable was found on PATH.",
+            "Install Claude Code (https://docs.claude.com/en/docs/claude-code), "
+            "log in, then click **Re-check** -- or set `ANTHROPIC_API_KEY`.",
+        ).as_dict()
+    try:
+        proc = subprocess.run(
+            [cli, "auth", "status", "--json"], env=_claude_cli_env(),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return "error", AskError(
+            "Couldn't run the Claude Code CLI",
+            f"Checking the login status with `{cli}` failed.",
+            None, str(e),
+        ).as_dict()
+    try:
+        status = json.loads(proc.stdout)
+    except ValueError:
+        status = None
+    if not isinstance(status, dict):
+        return "error", AskError(
+            "Couldn't read the Claude Code login status",
+            "`claude auth status` didn't return the expected JSON. The installed "
+            "CLI may be too old for this dashboard.",
+            "Update Claude Code (`claude update`), then click **Re-check**.",
+            (proc.stdout + proc.stderr).strip() or f"exit code {proc.returncode}",
+        ).as_dict()
+    if not status.get("loggedIn"):
+        return "error", AskError(
+            "Claude Code isn't logged in",
+            "Without an API key, Ask answers through your Claude Code login, "
+            "but the CLI reports no active login.",
+            _CLI_AUTH_HINT,
+        ).as_dict()
+    status["cli_path"] = cli
+    return "ok", status
+
+
+def _classify_cli_error(text, api_status):
+    """Map a failed CLI result onto a friendly AskError."""
+    lowered = (text or "").lower()
+    if api_status in (401, 403) or any(s in lowered for s in (
+        "not logged in", "/login", "oauth", "authentication", "invalid api key",
+        "credentials",
+    )):
+        return AskError(
+            "Claude Code couldn't authenticate",
+            "Your Claude Code login was rejected -- it may have expired or been revoked.",
+            _CLI_AUTH_HINT, text,
+        )
+    if api_status == 404 or "selected model" in lowered:
+        return AskError(
+            "Model not available",
+            f"Claude Code couldn't use `{ASK_MODEL}` -- it may not be enabled "
+            "for your account or organization.",
+            "Ask your Claude admin about access, or set `ANTHROPIC_API_KEY` to "
+            "use the API instead.",
+            text,
+        )
+    if api_status == 429 or any(s in lowered for s in ("rate limit", "usage limit", "limit reached")):
+        return AskError(
+            "Usage limit reached",
+            "Claude Code reports that your plan's usage or rate limit has been hit.",
+            "Wait a bit and try again, or set `ANTHROPIC_API_KEY` to use the API instead.",
+            text,
+        )
+    return AskError("Claude Code returned an error", "The request didn't complete.", None, text)
+
+
+def ask_claude_cli(question):
+    """Answer via `claude -p`, sandboxed to a single read-only SQL tool served
+    by ask_mcp_server.py. Returns (answer_text, sql_queries_run); raises
+    AskError with a presentable message on any failure."""
+    ok, status = _claude_cli_status()
+    if ok != "ok":
+        raise AskError(**status)
+
+    mcp_config = {"mcpServers": {"usage": {
+        "type": "stdio", "command": sys.executable, "args": [ASK_MCP_SERVER, DB_PATH],
+    }}}
+    cmd = [
+        status["cli_path"], "-p",
+        "--output-format", "stream-json", "--verbose",
+        "--model", ASK_MODEL,
+        "--system-prompt", _ask_system_prompt(),
+        # No built-in tools (Bash, file access, web...), only our MCP server,
+        # pre-approved so print mode never stalls on a permission prompt.
+        "--tools", "",
+        "--mcp-config", json.dumps(mcp_config), "--strict-mcp-config",
+        "--allowedTools", ASK_CLI_TOOL,
+        # Keeps Ask's own turns out of ~/.claude/projects, and so out of usage.db.
+        "--no-session-persistence",
+        "--setting-sources", "", "--disable-slash-commands",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd, env=_claude_cli_env(), cwd=os.path.dirname(DB_PATH),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as e:
+        raise AskError("Couldn't start the Claude Code CLI", str(e)) from e
+
+    import threading
+    timed_out = threading.Event()
+
+    def _on_timeout():
+        timed_out.set()
+        proc.kill()
+
+    timer = threading.Timer(ASK_TIMEOUT_SECONDS, _on_timeout)
+    timer.start()
+    # Drain stderr concurrently so a chatty CLI can't block on a full pipe.
+    stderr_chunks = []
+    stderr_reader = threading.Thread(
+        target=lambda: stderr_chunks.append(proc.stderr.read()), daemon=True,
+    )
+    stderr_reader.start()
+
+    queries_run, result, mcp_failure = [], None, None
+    try:
+        # The prompt goes over stdin, not argv, so a question starting with
+        # "-" can't be parsed as a flag.
+        proc.stdin.write(question)
+        proc.stdin.close()
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            kind = event.get("type")
+            if kind == "system" and event.get("subtype") == "init":
+                servers = {s.get("name"): s.get("status") for s in event.get("mcp_servers") or []}
+                # With the tool server down, the CLI carries on tool-less and
+                # the model improvises -- never let that reach the user.
+                if servers.get("usage") != "connected":
+                    mcp_failure = servers.get("usage") or "missing"
+                    proc.kill()
+                    break
+            elif kind == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if block.get("type") == "tool_use" and block.get("name") == ASK_CLI_TOOL:
+                        queries_run.append((block.get("input") or {}).get("sql", ""))
+            elif kind == "result":
+                result = event
+        proc.wait()
+    finally:
+        timer.cancel()
+    stderr_reader.join(timeout=2)
+    stderr = "".join(stderr_chunks).strip()
+
+    if timed_out.is_set():
+        raise AskError(
+            "Claude Code timed out",
+            f"No answer after {ASK_TIMEOUT_SECONDS} seconds, so the request was stopped.",
+            "Try again, or try a narrower question.",
+            stderr or None,
+        )
+    if mcp_failure:
+        raise AskError(
+            "The usage database tool didn't start",
+            f"Claude Code couldn't launch the SQL tool server (status: {mcp_failure}), "
+            "so the question wasn't sent.",
+            "Check that the dashboard's install is complete (re-run `claude-usage --update`).",
+            f"{sys.executable} {ASK_MCP_SERVER} {DB_PATH}\n\n{stderr}".strip(),
+        )
+    if result is None:
+        raise AskError(
+            "Claude Code exited unexpectedly",
+            f"The CLI stopped without returning an answer (exit code {proc.returncode}).",
+            "If this keeps happening, try `claude update`.",
+            stderr or None,
+        )
+    if result.get("is_error"):
+        raise _classify_cli_error(result.get("result") or stderr, result.get("api_error_status"))
+    return result.get("result") or "", queries_run
+
+
+# --- Tab ----------------------------------------------------------------------
+
 def tab_ask():
     st.subheader("Ask about your usage")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        st.info(
-            "This feature calls the Claude API, which requires an API key. "
-            "Set the `ANTHROPIC_API_KEY` environment variable and restart the "
-            "dashboard to enable it."
+    use_api = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if use_api:
+        st.caption(
+            "Queries your full history directly via SQL, independent of the filter bar above -- "
+            "and calls the real Claude API, which incurs its own (small) cost not logged in this DB."
         )
-        return
-
-    st.caption(
-        "Queries your full history directly via SQL, independent of the filter bar above -- "
-        "and calls the real Claude API, which incurs its own (small) cost not logged in this DB."
-    )
+    else:
+        st.info(
+            "No `ANTHROPIC_API_KEY` is set, so Ask answers through your **Claude Code "
+            "login** instead. That works, but an API key is the better setup: answers "
+            "come back faster (no CLI process to start per question) and don't depend "
+            "on the installed Claude Code version or its login staying valid. Set "
+            "`ANTHROPIC_API_KEY` and restart the dashboard to switch.",
+            icon=":material/info:",
+        )
+        ok, status = _claude_cli_status()
+        if ok != "ok":
+            _render_ask_error(status)
+            if st.button("Re-check", key="ask-recheck"):
+                _claude_cli_status.clear()
+                st.rerun()
+            return
+        who = status.get("email") or "your account"
+        org = status.get("orgName")
+        plan = status.get("subscriptionType")
+        extra = ", ".join(p for p in (org, plan and plan.capitalize()) if p)
+        st.caption(
+            f"Queries your full history directly via SQL, independent of the filter bar above. "
+            f"Answering via Claude Code as **{who}**" + (f" ({extra})" if extra else "") + "."
+        )
 
     # Spinner-in-place-of-button across reruns via session_state: each pass
     # renders either the form or the spinner, never both.
@@ -1530,12 +1758,17 @@ def tab_ask():
     if pending:
         with st.spinner("Thinking..."):
             try:
-                answer, queries = ask_claude(pending)
+                answer, queries = (ask_claude_api if use_api else ask_claude_cli)(pending)
                 st.session_state.ask_result = (answer, queries)
                 st.session_state.ask_error = None
+            except AskError as e:
+                st.session_state.ask_result = None
+                st.session_state.ask_error = e.as_dict()
             except Exception as e:
                 st.session_state.ask_result = None
-                st.session_state.ask_error = str(e)
+                st.session_state.ask_error = AskError(
+                    "Something went wrong", str(e) or type(e).__name__,
+                ).as_dict()
         st.session_state.ask_pending = None
         st.rerun()
     else:
@@ -1551,7 +1784,7 @@ def tab_ask():
             st.rerun()
 
     if st.session_state.get("ask_error"):
-        st.error(f"Request failed: {st.session_state.ask_error}")
+        _render_ask_error(st.session_state.ask_error)
         return
 
     result = st.session_state.get("ask_result")

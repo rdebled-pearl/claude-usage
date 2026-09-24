@@ -48,6 +48,7 @@ echo
 MANIFEST=(
     dashboard.py
     ingest.py
+    ask_mcp_server.py
     run_dashboard.sh
     uninstall.sh
     requirements.txt

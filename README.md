@@ -9,7 +9,8 @@ usage, cost, PRs, and trends.
 | File | Role |
 |------|------|
 | `ingest.py` | Reads `~/.claude/projects/**` transcripts into `usage.db`. Stdlib-only; run on a schedule by launchd. |
-| `dashboard.py` | Streamlit app: Overview, Explore, Insights, PRs, Trends, and an "Ask" tab (Claude API). |
+| `dashboard.py` | Streamlit app: Overview, Explore, Insights, PRs, Trends, and an "Ask" tab (Claude API or Claude Code login). |
+| `ask_mcp_server.py` | Read-only SQL tool for the "Ask" tab, used directly by the API backend and as a stdio MCP server by the Claude Code backend. Stdlib-only. |
 | `run_dashboard.sh` | Launches the Streamlit server (headless, port 8501). |
 | `bin/claude-usage` | User command: start/open the dashboard, plus `--status` / `--stop` / `--update` / `--help`. |
 | `requirements.txt` | Pinned dashboard dependencies, synced on every install/update. |
@@ -75,9 +76,22 @@ it in `MIGRATIONS`, and bump `SCHEMA_VERSION` (see the comments in `ingest.py`).
 
 ## The "Ask" tab
 
-Requires an `ANTHROPIC_API_KEY` in the environment. Without it, that tab shows a
-message instead of the input box. It calls the real Claude API (small cost, not
-logged in `usage.db`).
+Answers questions by letting Claude run read-only SQL against `usage.db`. Two
+backends, picked automatically:
+
+- **Anthropic API** (preferred) -- used when `ANTHROPIC_API_KEY` is set. Calls the
+  real Claude API (small cost, not logged in `usage.db`).
+- **Claude Code login** (fallback) -- with no key, it shells out to the `claude`
+  CLI (`claude -p`) using whatever that CLI is logged in with, e.g. a Claude
+  Enterprise seat. The CLI is sandboxed to a single read-only `run_sql` tool
+  (served by `ask_mcp_server.py`; all built-in tools disabled) and runs with
+  `--no-session-persistence`, so Ask's own turns don't end up in your usage
+  history. `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are stripped from its
+  environment so it can't silently bill a key instead. The tab checks
+  `claude auth status` first and shows a specific error (CLI missing, not
+  logged in, login rejected, model unavailable, usage limit, timeout, tool
+  server failed) rather than a generic failure. Slower than the API since each
+  question starts a CLI process, which is why the tab suggests setting a key.
 
 ## Configuration
 
