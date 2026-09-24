@@ -25,7 +25,10 @@ usage, cost, PRs, and trends.
 This:
 - copies the program to `~/.local/share/claude-usage/` (code + venv),
 - keeps mutable data (`usage.db`, logs) in `~/.local/state/claude-usage/`,
-- schedules the ingest job (every 4h) via launchd,
+- schedules the ingest job (every 30 minutes) via launchd -- launchd polls
+  `ingest.py --every-minutes 30` each minute and ingest runs only when due, so
+  the dashboard's refresh button (top right, beside the countdown) resets the
+  timer,
 - installs a `claude-usage` command at `~/.local/bin/claude-usage`,
 - optionally raises Claude Code's `cleanupPeriodDays` so more history survives.
 

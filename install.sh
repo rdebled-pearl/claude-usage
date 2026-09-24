@@ -22,6 +22,14 @@ BIN_DIR="$HOME/.local/bin"
 BIN_LINK="${BIN_DIR}/claude-usage"
 SETTINGS_PATH="$HOME/.claude/settings.json"
 SUGGESTED_RETENTION_DAYS=365
+# How often ingest runs. Ingest is incremental (per-file byte offsets, cached
+# PR lookups), so frequent runs are cheap. launchd polls every
+# INGEST_POLL_SECONDS and ingest.py itself decides whether it's due, which lets
+# a manual run (e.g. the dashboard's "ingest now") reset the countdown.
+# Changing either and running `claude-usage --update` rewrites and reloads the
+# plist on existing installs.
+INGEST_INTERVAL_MINUTES=30
+INGEST_POLL_SECONDS=60
 DEFAULT_RETENTION_DAYS=30
 
 echo "==> Installing Claude usage dashboard"
@@ -107,7 +115,7 @@ echo
 echo "==> Transcript retention (cleanupPeriodDays)"
 echo "    Claude Code deletes session transcripts under ~/.claude/projects/ after"
 echo "    cleanupPeriodDays (${DEFAULT_RETENTION_DAYS} days if unset). The ingest job reads those files every"
-echo "    4h, so day-to-day usage is unaffected either way - but anything pruned before"
+echo "    ${INGEST_INTERVAL_MINUTES} minutes, so day-to-day usage is unaffected either way - but anything pruned before"
 echo "    ingest ever sees it is lost from your history for good (e.g. after the Mac"
 echo "    was asleep/off across a boundary, or before you first installed this tool)."
 echo "    Longer retention means more raw transcripts kept on disk in the meantime."
@@ -178,7 +186,7 @@ PYEOF
 # --- 5. Schedule the ingest job via launchd -------------------------------
 echo
 echo "==> Scheduling the ingest job with launchd (label: ${PLIST_LABEL})."
-echo "    Runs ${INSTALL_DIR}/ingest.py every 4h, plus once now, to keep usage.db current."
+echo "    Runs ${INSTALL_DIR}/ingest.py every ${INGEST_INTERVAL_MINUTES} minutes (and now, if due) to keep usage.db current."
 mkdir -p "$HOME/Library/LaunchAgents"
 # launchd starts jobs with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) that
 # omits Homebrew, so `gh` (used for PR resolution) wouldn't be found. Build a
@@ -200,6 +208,8 @@ cat > "$PLIST_PATH" <<PLISTEOF
     <array>
         <string>/usr/bin/python3</string>
         <string>${INSTALL_DIR}/ingest.py</string>
+        <string>--every-minutes</string>
+        <string>${INGEST_INTERVAL_MINUTES}</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -209,7 +219,7 @@ cat > "$PLIST_PATH" <<PLISTEOF
         <string>${LAUNCHD_PATH}</string>
     </dict>
     <key>StartInterval</key>
-    <integer>14400</integer>
+    <integer>${INGEST_POLL_SECONDS}</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>

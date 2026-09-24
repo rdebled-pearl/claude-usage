@@ -9,6 +9,7 @@ usage.db
 usage.db.bak-*
 ingest.lock
 ingest.progress
+ingest.schedule.json
 
 # Logs
 *.log

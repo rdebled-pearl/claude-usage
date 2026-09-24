@@ -52,6 +52,10 @@ DB_PATH = os.path.join(BASE_DIR, "usage.db")
 LOCK_PATH = os.path.join(BASE_DIR, "ingest.lock")
 LOG_PATH = os.path.join(BASE_DIR, "ingest.log")
 PROGRESS_PATH = os.path.join(BASE_DIR, "ingest.progress")
+# {"last_run": epoch secs, "interval_minutes": int}. ingest owns the schedule
+# (launchd just polls with --every-minutes), so any run -- scheduled, manual,
+# or from the dashboard -- resets the countdown the dashboard shows.
+SCHEDULE_PATH = os.path.join(BASE_DIR, "ingest.schedule.json")
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 PR_LOOKUP_LIMIT_PER_RUN = 50
 PR_CACHE_TTL_SECONDS = 24 * 3600
@@ -504,9 +508,61 @@ def enrich_prs(conn, progress=None):
             )
 
 
-def main():
+def read_schedule():
+    try:
+        with open(SCHEDULE_PATH) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_schedule(**updates):
+    """Merge `updates` into the schedule file atomically (tmp + rename)."""
+    data = {**read_schedule(), **updates}
+    tmp = SCHEDULE_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, SCHEDULE_PATH)
+    except OSError:
+        pass
+
+
+def parse_args(argv):
+    import argparse
+    parser = argparse.ArgumentParser(description="Ingest Claude Code usage into usage.db.")
+    parser.add_argument(
+        "--every-minutes", type=int, metavar="N",
+        help="Scheduled mode: exit without doing anything unless N minutes "
+             "have passed since the last run. launchd polls with this.",
+    )
+    return parser.parse_args(argv)
+
+
+def ingest_is_due(every_minutes):
+    """Record the configured interval and report whether a scheduled run
+    should go ahead now."""
+    schedule = read_schedule()
+    if schedule.get("interval_minutes") != every_minutes:
+        write_schedule(interval_minutes=every_minutes)
+    last_run = schedule.get("last_run")
+    if not isinstance(last_run, (int, float)):
+        return True
+    # A clock that jumped backwards shouldn't stall ingest indefinitely.
+    elapsed = time.time() - last_run
+    return elapsed < 0 or elapsed >= every_minutes * 60
+
+
+def main(argv=None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     os.makedirs(BASE_DIR, exist_ok=True)
+    if args.every_minutes is not None and not ingest_is_due(args.every_minutes):
+        return
     lock_fd = acquire_lock()
+    # Stamped at start (not completion) so a run that keeps failing retries
+    # on the normal cadence rather than on every poll.
+    write_schedule(last_run=time.time())
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 

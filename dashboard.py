@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 
 import pandas as pd
 import plotly.express as px
@@ -30,6 +31,7 @@ def _data_dir():
 DB_PATH = os.path.join(_data_dir(), "usage.db")
 LOCK_PATH = os.path.join(_data_dir(), "ingest.lock")
 PROGRESS_PATH = os.path.join(_data_dir(), "ingest.progress")
+SCHEDULE_PATH = os.path.join(_data_dir(), "ingest.schedule.json")
 INGEST_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ingest.py")
 
 _LIGHT = dict(
@@ -441,6 +443,8 @@ def inject_css():
            heights); every other st.columns() pair top-aligns by default. */
         div[data-testid="stHorizontalBlock"] {{ align-items: start; }}
         .st-key-filter-bar-row div[data-testid="stHorizontalBlock"] {{ align-items: end; }}
+        /* Headless localStorage bridge; takes no space in the layout. */
+        .st-key-filter-prefs-host {{ display: none; }}
 
         /* Multiselect/date-input fields render as React Aria components, not
            BaseWeb -- [data-baseweb=...] selectors don't match here. */
@@ -525,9 +529,116 @@ def inject_css():
     )
 
 
+RANGE_OPTIONS = ["Today", "7d", "30d", "90d", "All", "Custom"]
+FILTER_PARAMS = ("range", "repo", "model", "from", "to")
+FILTER_WIDGET_KEYS = ("f_range", "f_repos", "f_models", "f_custom")
+FILTER_PREFS_KEY = "filter-prefs"
+
+# Headless bridge between the URL-held filter state and localStorage, so a
+# bare URL (e.g. from `claude-usage`) resumes the last selection. On the first
+# render of a page load with no filters in the URL, it hands the saved query
+# string back to Python; otherwise it saves the current one.
+_filter_prefs_component = st.components.v2.component(
+    "filter_prefs",
+    js="""
+    export default function({ data, setTriggerValue }) {
+        const KEY = "claude-usage:filters";
+        let saved = null;
+        try { saved = localStorage.getItem(KEY); } catch (e) {}
+        if (!window.__claudeUsageFiltersChecked) {
+            window.__claudeUsageFiltersChecked = true;
+            if (!data.url_had_filters && saved && saved !== data.qs) {
+                setTriggerValue("restore", saved);
+                return;
+            }
+        }
+        try { localStorage.setItem(KEY, data.qs); } catch (e) {}
+    }
+    """,
+)
+
+
+def _restore_filters():
+    """Apply the localStorage-saved query string, then drop the widget state
+    so the next run re-seeds (and re-validates) every filter from the URL."""
+    saved = (st.session_state.get(FILTER_PREFS_KEY) or {}).get("restore")
+    if not saved:
+        return
+    parsed = urllib.parse.parse_qs(saved)
+    st.query_params.from_dict(
+        {k: v if k in ("repo", "model") else v[0] for k, v in parsed.items() if k in FILTER_PARAMS}
+    )
+    for key in FILTER_WIDGET_KEYS:
+        st.session_state.pop(key, None)
+
+
+def _parse_iso_date(value):
+    try:
+        return dt.date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _seed_filter_state(repo_options, model_options, min_date, max_date):
+    """Initialise filter widget state from the URL, once per session (or after
+    a restore). Values are validated so a stale/hand-edited URL can't feed a
+    widget an option it doesn't have."""
+    qp = st.query_params
+    if "_url_had_filters" not in st.session_state:
+        st.session_state["_url_had_filters"] = any(k in qp for k in FILTER_PARAMS)
+
+    if "f_range" not in st.session_state:
+        preset = qp.get("range")
+        st.session_state.f_range = preset if preset in RANGE_OPTIONS else "All"
+    if "f_repos" not in st.session_state:
+        st.session_state.f_repos = [r for r in qp.get_all("repo") if r in repo_options]
+    if "f_models" not in st.session_state:
+        st.session_state.f_models = [m for m in qp.get_all("model") if m in model_options]
+    if "f_custom" not in st.session_state:
+        start = _parse_iso_date(qp.get("from")) or min_date
+        end = _parse_iso_date(qp.get("to")) or max_date
+        start = min(max(start, min_date), max_date)
+        end = min(max(end, start), max_date)
+        st.session_state.f_custom = (start, end)
+
+
+def _persist_filters(preset, repos, models, custom_range):
+    """Mirror the current selection into the URL and localStorage."""
+    params = {}
+    if preset:
+        params["range"] = preset
+    if repos:
+        params["repo"] = repos
+    if models:
+        params["model"] = models
+    if preset == "Custom" and isinstance(custom_range, tuple) and len(custom_range) == 2:
+        params["from"], params["to"] = (d.isoformat() for d in custom_range)
+
+    # Only touch our own keys so unrelated params survive.
+    for key in FILTER_PARAMS:
+        if key not in params and key in st.query_params:
+            del st.query_params[key]
+    for key, value in params.items():
+        if (st.query_params.get_all(key) if isinstance(value, list) else st.query_params.get(key)) != value:
+            st.query_params[key] = value
+
+    with st.container(key="filter-prefs-host"):
+        _filter_prefs_component(
+            key=FILTER_PREFS_KEY,
+            data={
+                "qs": urllib.parse.urlencode(params, doseq=True),
+                "url_had_filters": st.session_state["_url_had_filters"],
+            },
+            on_restore_change=_restore_filters,
+        )
+
+
 def filter_bar(df):
     """One always-visible row above every chart; every tab reads its output."""
     min_date, max_date = df["date"].min().date(), df["date"].max().date()
+    repo_options = sorted(df["repo"].dropna().unique())
+    model_options = sorted(df["model"].dropna().unique())
+    _seed_filter_state(repo_options, model_options, min_date, max_date)
 
     # Two stacked rows: the custom-range picker only appears for "Custom",
     # directly under the preset control rather than off to the side.
@@ -535,18 +646,18 @@ def filter_bar(df):
     c_preset, c_repo, c_model = filter_row.columns([2, 1.5, 1.5])
     with c_preset:
         preset = st.segmented_control(
-            "Date range", ["7d", "30d", "90d", "All", "Custom"],
-            default="All", label_visibility="collapsed",
+            "Date range", RANGE_OPTIONS,
+            key="f_range", label_visibility="collapsed",
         )
 
     with c_repo:
         repos = st.multiselect(
-            "Repo", sorted(df["repo"].dropna().unique()),
+            "Repo", repo_options, key="f_repos",
             placeholder="All repos", label_visibility="collapsed",
         )
     with c_model:
         models = st.multiselect(
-            "Model", sorted(df["model"].dropna().unique()),
+            "Model", model_options, key="f_models",
             placeholder="All models", label_visibility="collapsed",
         )
 
@@ -557,13 +668,19 @@ def filter_bar(df):
             # Fixed width instead of the column-filling default, sized to
             # hold just the date-range content.
             custom_range = st.date_input(
-                "Custom range", (min_date, max_date),
+                "Custom range", key="f_custom",
                 min_value=min_date, max_value=max_date,
                 label_visibility="collapsed", width=300,
             )
 
+    _persist_filters(preset, repos, models, custom_range)
+
     preset_days = {"7d": 7, "30d": 30, "90d": 90}
-    if preset in preset_days:
+    if preset == "Today":
+        # Actual calendar day (dates are stored in local time), not the
+        # latest day with data, so an idle day shows as empty.
+        start = end = dt.date.today()
+    elif preset in preset_days:
         start = max_date - pd.Timedelta(days=preset_days[preset])
         end = max_date
     elif preset == "Custom" and isinstance(custom_range, tuple) and len(custom_range) == 2:
@@ -1665,6 +1782,9 @@ def _run_ingest_with_animation(proc):
     elapsed = int(time.time() - start)
     render(1.0, "Done \u2014 loading your dashboard\u2026", elapsed)
     st.session_state["ingest_completed"] = True
+    st.session_state.pop("purge_rebuild_running", None)
+    # Already reloading below; stop the header timer triggering a second one.
+    st.session_state["ingest_seen_run"] = _read_schedule()[0]
     load_data.clear()
     time.sleep(0.6)
     st.rerun()
@@ -1719,6 +1839,40 @@ def _render_settings_button():
         .st-key-settings-gear button [data-testid="stIconMaterial"] {{
             font-size: 1.35rem; color: inherit !important;
         }}
+
+        /* Ingest countdown pill, just left of the gear (2.6rem + gap). */
+        .st-key-ingest-timer {{
+            position: fixed; top: 3.25rem; right: 3.85rem; z-index: 999999;
+            width: auto; height: 2.6rem; padding: 0 0.3rem 0 0.9rem;
+            border: 1px solid {BORDER}; border-radius: 1.3rem;
+            background: {SURFACE}; box-shadow: 0 1px 4px rgba(11,6,32,0.08);
+        }}
+        /* !important: beats the global start-alignment for horizontal blocks
+           and the global filled-purple button style. */
+        div.st-key-ingest-timer {{ align-items: center !important; }}
+        .st-key-ingest-timer [data-testid="stMarkdownContainer"],
+        .st-key-ingest-timer [data-testid="stMarkdownContainer"] p {{ margin: 0 !important; }}
+        .ingest-timer__label {{
+            font-family: 'IBM Plex Mono', monospace; font-size: .8rem;
+            color: {INK_SECONDARY}; white-space: nowrap;
+        }}
+        .st-key-ingest-timer div[data-testid="stButton"] button {{
+            border-radius: 50% !important; width: 2rem; height: 2rem;
+            padding: 0 !important; min-height: 0; border: none !important;
+            background: transparent !important; box-shadow: none !important;
+            color: {ACCENT} !important;
+            transition: background-color .15s ease;
+        }}
+        .st-key-ingest-timer div[data-testid="stButton"] button:hover:not(:disabled) {{
+            background: {LAVENDER_PALE} !important;
+        }}
+        .st-key-ingest-timer div[data-testid="stButton"] button:disabled {{
+            color: {MUTED} !important; opacity: .6;
+        }}
+        .st-key-ingest-timer button p {{ color: inherit !important; }}
+        .st-key-ingest-timer button [data-testid="stIconMaterial"] {{
+            font-size: 1.2rem; color: inherit !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1729,25 +1883,100 @@ def _render_settings_button():
             _settings_dialog()
 
 
+def _read_schedule():
+    """(last_run, interval_minutes) from ingest's schedule file; either may be
+    None (no run recorded yet / no scheduled job configured)."""
+    try:
+        with open(SCHEDULE_PATH) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    last_run, interval = data.get("last_run"), data.get("interval_minutes")
+    return (
+        last_run if isinstance(last_run, (int, float)) else None,
+        interval if isinstance(interval, int) and interval > 0 else None,
+    )
+
+
+def _manual_ingest_running():
+    proc = st.session_state.get("manual_ingest_proc")
+    return proc is not None and proc.poll() is None
+
+
+def _ingest_timer_label(last_run, interval):
+    if _manual_ingest_running() or _ingest_in_progress():
+        return "Ingesting\u2026"
+    if interval is None:
+        return None
+    if last_run is None:
+        return "Next ingest <1m"
+    remaining = last_run + interval * 60 - time.time()
+    # Ceil so the label only reads "0" territory once it's actually due;
+    # launchd polls once a minute, so "<1m" can linger up to a minute.
+    minutes = -(-int(remaining) // 60)
+    return "Next ingest <1m" if minutes <= 0 else f"Next ingest {minutes}m"
+
+
+@st.fragment(run_every=5)
+def _render_ingest_timer():
+    """Countdown to the next scheduled ingest plus an "ingest now" button,
+    pinned beside the settings gear. Reruns on its own every few seconds; when
+    any ingest (ours or launchd's) finishes, reruns the whole app so charts
+    pick up the new rows."""
+    last_run, interval = _read_schedule()
+    running = _manual_ingest_running() or _ingest_in_progress()
+
+    seen = st.session_state.setdefault("ingest_seen_run", last_run)
+    if not running and last_run != seen:
+        st.session_state["ingest_seen_run"] = last_run
+        st.session_state.pop("manual_ingest_proc", None)
+        st.rerun(scope="app")
+
+    label = _ingest_timer_label(last_run, interval)
+    tip = "Ingest now and reset the timer"
+    if last_run is not None:
+        tip += f" (last run {dt.datetime.fromtimestamp(last_run):%H:%M})"
+
+    with st.container(key="ingest-timer", horizontal=True, wrap=False,
+                      width="content", vertical_alignment="center", gap="small"):
+        if label:
+            st.markdown(f'<span class="ingest-timer__label">{label}</span>',
+                        unsafe_allow_html=True)
+        if st.button("", icon=":material/refresh:", key="ingest-now-btn",
+                     help=tip, disabled=running):
+            st.session_state["manual_ingest_proc"] = _start_ingest()
+            st.rerun(scope="fragment")
+
+
 def main():
     apply_theme()
     inject_css()
 
-    # (Re)build path: explicit purge request, an ingest already underway, or a
-    # fresh install with no data yet. All three land on the same animation.
+    # The full-screen build animation is reserved for first-time setup (no
+    # data yet) and an explicit "Purge & rebuild". Routine ingests (scheduled
+    # or the header refresh button) run behind the live dashboard instead; the
+    # header timer shows "Ingesting\u2026" and reloads the page when done.
     if st.session_state.pop("force_ingest", False):
+        st.session_state["purge_rebuild_running"] = True
         _run_ingest_with_animation(_start_ingest())
         return
-    if _ingest_in_progress():
+    first_setup = not _db_has_rows()
+    if _ingest_in_progress() and (
+        first_setup or st.session_state.get("purge_rebuild_running")
+    ):
+        # Re-attach after a rerun mid-build, e.g. the user clicked something.
         _run_ingest_with_animation(None)
         return
-    if not _db_has_rows() and not st.session_state.get("ingest_completed"):
+    if first_setup and not st.session_state.get("ingest_completed"):
         _run_ingest_with_animation(_start_ingest())
         return
 
     st.markdown('<div class="eyebrow">Personal cost intelligence</div>', unsafe_allow_html=True)
     st.title("Claude Code Usage")
     _render_settings_button()
+    _render_ingest_timer()
 
     if not _db_has_rows():
         st.info(
