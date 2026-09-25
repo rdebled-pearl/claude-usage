@@ -9,7 +9,7 @@ usage, cost, PRs, and trends.
 | File | Role |
 |------|------|
 | `ingest.py` | Reads `~/.claude/projects/**` transcripts into `usage.db`. Stdlib-only; run on a schedule by launchd. |
-| `dashboard.py` | Streamlit app: Overview, Explore, Insights, PRs, Trends, and an "Ask" tab (Claude API or Claude Code login). |
+| `dashboard.py` | Streamlit app: Overview, Explore, Insights, PRs, Trends, Tools, and an "Ask" tab (Claude API or Claude Code login). |
 | `ask_mcp_server.py` | Read-only SQL tool for the "Ask" tab, used directly by the API backend and as a stdio MCP server by the Claude Code backend. Stdlib-only. |
 | `run_dashboard.sh` | Launches the Streamlit server (headless, port 8501). |
 | `bin/claude-usage` | User command: start/open the dashboard, plus `--status` / `--stop` / `--update` / `--help`. |
@@ -73,6 +73,31 @@ the code's `SCHEMA_VERSION`; fresh DBs are created at the latest shape directly.
 A DB newer than the running code is detected and refused rather than corrupted.
 To evolve the schema: update `SCHEMA`, add a `_migrate_to_N()` function, register
 it in `MIGRATIONS`, and bump `SCHEMA_VERSION` (see the comments in `ingest.py`).
+
+## The "Tools" tab
+
+Transcripts don't bill tool calls separately -- a tool's result is paid for as
+input on the turns that follow it -- so tool cost is estimated:
+
+- **Cost & context by tool** (`tool_calls` table, one row per call): each call's
+  estimated cost = writing its input (output tokens on the issuing turn) + the
+  cache write of its result on the next turn + re-reading that result from cache
+  on every later turn in the same context until a compaction (`context_resets`).
+  Token counts are estimated from result size (chars / 4). Recomputed after every
+  ingest, since re-read cost grows while a session continues. Grouped by tool,
+  MCP server, or built-in vs MCP, with a cost/tokens toggle.
+- **Turns attributed to skills & MCP tools** (`usage_events.attribution_*`):
+  Claude Code tags a turn with the active skill, or the MCP tool whose result it
+  was reading. Only recent Claude Code versions record this, and a turn's cost
+  includes re-reading the whole context, so treat these totals as relative, not
+  marginal.
+
+The same tool stats appear per PR in the PRs tab's lookup, and the Overview cost
+chart overlays estimated tool cost as a dashed line.
+
+These came with schema v2 (tool calls, attribution) and v3 (cost estimates,
+compaction points); each migration rewinds ingest's per-file offsets so the next
+run backfills from existing transcripts.
 
 ## The "Ask" tab
 

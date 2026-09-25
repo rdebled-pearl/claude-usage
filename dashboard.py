@@ -166,13 +166,20 @@ def style_axes(fig, hovermode="closest", spikes=True):
 @st.cache_data(ttl=60)
 def load_data(db_mtime):
     conn = sqlite3.connect(DB_PATH)
+    # Attribution columns arrive with schema v2; until ingest has migrated the
+    # DB (it runs separately), select NULLs in their place.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(usage_events)")}
+    attribution = ", ".join(
+        c if c in columns else f"NULL AS {c}" for c in ATTRIBUTION_COLUMNS
+    )
     df = pd.read_sql_query(
-        """
+        f"""
         SELECT date, timestamp, session_id, model, repo, branch, pr_number, pr_url,
                is_subagent, agent_id, agent_type, agent_description,
                input_tokens, output_tokens, cache_read_input_tokens,
                cache_creation_5m_tokens, cache_creation_1h_tokens, thinking_tokens,
-               input_cost, output_cost, cache_write_cost, cache_read_cost, total_cost
+               input_cost, output_cost, cache_write_cost, cache_read_cost, total_cost,
+               {attribution}
         FROM usage_events
         """,
         conn,
@@ -191,6 +198,54 @@ def load_data(db_mtime):
     df["dow"] = ts_local.dt.day_name()
     df["cache_write_tokens"] = df["cache_creation_5m_tokens"] + df["cache_creation_1h_tokens"]
     return df
+
+
+ATTRIBUTION_COLUMNS = ("attribution_mcp_server", "attribution_mcp_tool", "attribution_skill")
+# Mirrors ingest.CHARS_PER_TOKEN, which computes tool_calls.result_tokens_est.
+CHARS_PER_TOKEN_EST = 4
+
+
+@st.cache_data(ttl=60)
+def load_tool_calls(db_mtime):
+    """All tool_calls rows, or an empty frame if the table doesn't exist yet
+    (ingest hasn't migrated the DB to schema v2). Cost estimates arrive with
+    v3; on a v2 DB they load as NULL."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tool_calls)")}
+        cost_cols = ", ".join(
+            f"t.{c}" if c in columns else f"NULL AS {c}" for c in TOOL_COST_COLUMNS
+        )
+        # PR comes from the turn that made the call (tool_calls has no PR of
+        # its own; PR enrichment only updates usage_events).
+        df = pd.read_sql_query(
+            f"""SELECT t.date, t.timestamp, t.session_id, t.model, t.repo, t.is_subagent, t.tool_name,
+                       t.mcp_server, t.mcp_tool, t.skill, t.result_chars, t.result_images,
+                       t.result_tokens_est, t.is_error, {cost_cols}, u.pr_number
+                FROM tool_calls t
+                LEFT JOIN usage_events u ON u.message_id = t.message_id""",
+            conn,
+        ) if columns else pd.DataFrame()
+    except (sqlite3.Error, pd.errors.DatabaseError):
+        df = pd.DataFrame()
+    finally:
+        conn.close()
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        # Local wall-clock time (tz-naive), for hourly charts.
+        local_tz = dt.datetime.now().astimezone().tzinfo
+        df["ts_local"] = (
+            pd.to_datetime(df["timestamp"], utc=True, format="ISO8601", errors="coerce")
+            .dt.tz_convert(local_tz).dt.tz_localize(None)
+        )
+        df["result_tokens_est"] = df["result_tokens_est"].fillna(0).astype(int)
+        df["is_error"] = df["is_error"].fillna(0).astype(bool)
+        for c in TOOL_COST_COLUMNS:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+TOOL_COST_COLUMNS = ("est_input_cost", "est_write_cost", "est_reread_cost", "est_cost", "rereads")
 
 
 def get_db_mtime():
@@ -805,19 +860,74 @@ def render_kpi_band(df, prior_df=None):
     st.markdown(f'<div class="kpi-band">{cells}</div>', unsafe_allow_html=True)
 
 
-def tab_overview(df, model_color_map, top_models):
-    st.subheader("Cost over time")
-    daily = fold_top_n(df, "model", top_values=top_models)
-    daily = daily.groupby(["date", "model"], as_index=False)["total_cost"].sum()
+def tab_overview(df, model_color_map, top_models, calls=None, meta=None):
+    # A single-day range ("Today", or a one-day custom range) has only one
+    # daily point, which makes Plotly zoom to milliseconds around it -- so
+    # plot that day hourly, pinned to midnight-to-midnight.
+    single_day = meta is not None and meta["start"] == meta["end"]
+    st.subheader("Cost by hour" if single_day else "Cost over time")
+
+    folded = fold_top_n(df, "model", top_values=top_models)
+    models = top_models + ["Other"]
+    if single_day:
+        day_start = pd.Timestamp(meta["start"])
+        buckets = pd.date_range(day_start, periods=24, freq="h")
+        folded = folded.assign(bucket=folded["ts_local"].dt.tz_localize(None).dt.floor("h"))
+        # Complete hour x model grid so empty hours drop to 0 instead of the
+        # area interpolating across them.
+        series = (
+            folded.pivot_table(index="bucket", columns="model", values="total_cost",
+                               aggfunc="sum", fill_value=0.0)
+            .reindex(buckets, fill_value=0.0)
+            .rename_axis("bucket").reset_index()
+            .melt(id_vars="bucket", var_name="model", value_name="total_cost")
+        )
+        x_label = "Hour"
+    else:
+        series = (
+            folded.groupby(["date", "model"], as_index=False)["total_cost"].sum()
+            .rename(columns={"date": "bucket"})
+        )
+        x_label = "Date"
     fig = px.area(
-        daily, x="date", y="total_cost", color="model",
+        series, x="bucket", y="total_cost", color="model",
         color_discrete_map=model_color_map,
-        category_orders={"model": top_models + ["Other"]},
-        labels={"total_cost": "Cost ($)", "date": "Date", "model": "Model"},
+        category_orders={"model": models},
+        labels={"total_cost": "Cost per hour ($)" if single_day else "Cost ($)",
+                "bucket": x_label, "model": "Model"},
     )
     fig.update_traces(line=dict(width=2))
+
+    # Estimated tool cost per bucket (all models and sessions), overlaid rather
+    # than stacked so it reads as "how much of that spend was tools".
+    has_tool_cost = calls is not None and not calls.empty and calls["est_cost"].notna().any()
+    if has_tool_cost:
+        if single_day:
+            tool_series = (
+                calls.assign(bucket=calls["ts_local"].dt.floor("h"))
+                .groupby("bucket")["est_cost"].sum().reindex(buckets, fill_value=0.0)
+            )
+        else:
+            days = pd.DatetimeIndex(sorted(series["bucket"].unique()))
+            tool_series = calls.groupby("date")["est_cost"].sum().reindex(days, fill_value=0.0)
+        fig.add_trace(go.Scatter(
+            x=tool_series.index, y=tool_series.values, name="Est. tool cost",
+            mode="lines", line=dict(color=INK_PRIMARY, width=2, dash="dash"),
+            hovertemplate="Est. tool cost: $%{y:,.2f}<extra></extra>",
+        ))
     style_axes(fig, hovermode="x")
+    if single_day:
+        fig.update_xaxes(
+            range=[day_start, day_start + pd.Timedelta(days=1)],
+            dtick=3 * 3600 * 1000, tickformat="%H:%M", hoverformat="%H:%M",
+        )
     st.plotly_chart(fig, width='stretch')
+    if has_tool_cost:
+        st.caption(
+            "Dashed line: estimated tool cost (cache write + re-reads of tool results, plus "
+            "writing the calls' input), counted when the tool was called -- see the "
+            "Tools tab for the breakdown."
+        )
 
     left, right = st.columns(2)
 
@@ -1199,7 +1309,7 @@ def tab_insights(df):
         st.plotly_chart(fig, width='stretch')
 
 
-def tab_prs(df):
+def tab_prs(df, calls):
     pr_df = df[df["pr_number"].notna()].copy()
     coverage = len(pr_df) / len(df) if len(df) else 0
     st.caption(
@@ -1282,6 +1392,12 @@ def tab_prs(df):
         style_axes(fig)
         fig.update_layout(showlegend=False, height=200, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, width='stretch')
+
+    chosen_row = leaderboard[leaderboard["pr_label"] == chosen].iloc[0]
+    pr_calls = calls[
+        (calls["repo"] == chosen_row["repo"]) & (calls["pr_number"] == chosen_row["pr_number"])
+    ] if not calls.empty and "pr_number" in calls else calls
+    _render_pr_tools(pr_calls, pr_events)
 
 
 def render_time_heatmap(df):
@@ -1457,10 +1573,10 @@ def _ask_system_prompt():
 
 @beta_tool
 def run_sql(sql: str) -> str:
-    """Run a read-only SQL query against the usage_events table and return the results as JSON.
+    """Run a read-only SQL query against the usage_events or tool_calls table and return the results as JSON.
 
     Args:
-        sql: A single SELECT (or WITH ... SELECT) statement against usage_events.
+        sql: A single SELECT (or WITH ... SELECT) statement against usage_events or tool_calls.
             No INSERT/UPDATE/DELETE/DDL and no multiple statements.
     """
     return run_sql_query(DB_PATH, sql)
@@ -1799,6 +1915,346 @@ def tab_ask():
         with st.expander("SQL run"):
             for q in queries:
                 st.code(q, language="sql")
+
+
+def filter_tool_calls(tool_df, meta):
+    """Apply the filter bar's date/repo/model selection to tool_calls (model
+    is the model of the turn that issued the call)."""
+    if tool_df.empty:
+        return tool_df
+    out = tool_df[
+        (tool_df["date"].dt.date >= meta["start"]) & (tool_df["date"].dt.date <= meta["end"])
+    ]
+    if meta.get("repos"):
+        out = out[out["repo"].isin(meta["repos"])]
+    if meta.get("models"):
+        out = out[out["model"].isin(meta["models"])]
+    return out
+
+
+def _tool_labels(calls):
+    """'server \u00b7 tool' for MCP calls, 'Skill \u00b7 name' for skill loads, else the
+    built-in tool name. (Missing values are NaN here, which is truthy -- so
+    test with notna(), never plain truthiness.)"""
+    labels = calls["tool_name"].copy()
+    is_skill = (calls["tool_name"] == "Skill") & calls["skill"].notna()
+    labels[is_skill] = "Skill \u00b7 " + calls.loc[is_skill, "skill"]
+    is_mcp = calls["mcp_server"].notna()
+    labels[is_mcp] = (
+        calls.loc[is_mcp, "mcp_server"] + " \u00b7 " + calls.loc[is_mcp, "mcp_tool"].fillna("?")
+    )
+    return labels
+
+
+def _hbar(data, x, y, x_label, height=None):
+    fig = px.bar(
+        data.sort_values(x), x=x, y=y, orientation="h",
+        color_discrete_sequence=[ACCENT], labels={x: x_label, y: ""},
+    )
+    style_axes(fig)
+    fig.update_layout(
+        showlegend=False, height=height or max(220, 28 * len(data) + 60),
+        margin=dict(l=10, r=10, t=10, b=10),
+    )
+    return fig
+
+
+def _summarize_tools(grouped, sort_key="est_cost"):
+    """Per-`group` tool stats (calls, errors, estimated cost split, tokens),
+    sorted by `sort_key` with each group's percentage share of it."""
+    table = (
+        grouped.groupby("group", as_index=False)
+        .agg(
+            calls=("tool_name", "size"),
+            errors=("is_error", "sum"),
+            est_cost=("est_cost", "sum"),
+            write_cost=("est_write_cost", "sum"),
+            reread_cost=("est_reread_cost", "sum"),
+            input_cost=("est_input_cost", "sum"),
+            est_tokens=("result_tokens_est", "sum"),
+            largest=("result_tokens_est", "max"),
+            avg_rereads=("rereads", "mean"),
+            images=("result_images", "sum"),
+        )
+    )
+    table["avg_cost"] = table["est_cost"] / table["calls"]
+    table["avg_tokens"] = table["est_tokens"] / table["calls"]
+    table = table.sort_values(sort_key, ascending=False)
+    total = table[sort_key].sum()
+    table["share"] = table[sort_key] / total * 100 if total else 0.0
+    return table
+
+
+def _render_pr_tools(pr_calls, pr_events):
+    """Tool usage for one PR: headline numbers, per-tool table, and the skills
+    / MCP tools Claude Code attributed its turns to."""
+    st.divider()
+    st.subheader("Tool usage on this PR")
+    if pr_calls.empty:
+        st.info("No tool calls recorded for this PR in the current filter.")
+        return
+
+    has_cost = pr_calls["est_cost"].notna().any()
+    pr_cost = pr_events["total_cost"].sum()
+    tool_cost = pr_calls["est_cost"].sum()
+    is_mcp = pr_calls["mcp_server"].notna()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tool calls", f"{len(pr_calls):,}")
+    c2.metric("MCP calls", f"{is_mcp.sum():,}")
+    if has_cost:
+        c3.metric("Est. tool cost", f"${tool_cost:,.2f}",
+                  help="Cache write + re-reads of tool results, plus writing the calls' input.")
+        c4.metric("Share of PR cost", f"{tool_cost / pr_cost * 100:.0f}%" if pr_cost else "\u2013")
+    else:
+        c3.metric("Est. tokens returned", f"{pr_calls['result_tokens_est'].sum():,}")
+        c4.metric("Error rate", f"{pr_calls['is_error'].mean() * 100:.1f}%")
+
+    grouped = pr_calls.assign(group=_tool_labels(pr_calls))
+    table = _summarize_tools(grouped, "est_cost" if has_cost else "est_tokens")
+    cost_columns = ["est_cost", "share", "avg_cost"] if has_cost else ["share"]
+    st.dataframe(
+        table[["group", "calls", "errors", *cost_columns, "est_tokens", "largest"]],
+        width="stretch", height=min(320, 36 * len(table) + 40), hide_index=True,
+        column_config={
+            "group": st.column_config.TextColumn("Tool"),
+            "calls": st.column_config.NumberColumn("Calls", format="%d"),
+            "errors": st.column_config.NumberColumn("Errors", format="%d"),
+            "est_cost": st.column_config.NumberColumn("Est. cost", format="$%.2f"),
+            "share": st.column_config.ProgressColumn(
+                "Share", format="%.0f%%", min_value=0, max_value=100,
+            ),
+            "avg_cost": st.column_config.NumberColumn("Avg cost / call", format="$%.4f"),
+            "est_tokens": st.column_config.NumberColumn("Est. tokens", format="%d"),
+            "largest": st.column_config.NumberColumn("Largest", format="%d"),
+        },
+    )
+
+    # Skills / MCP tools Claude Code tagged this PR's turns with.
+    tagged = pr_events.assign(
+        via=pr_events["attribution_skill"].where(
+            pr_events["attribution_skill"].notna(),
+            pr_events["attribution_mcp_server"].fillna("?") + " \u00b7 "
+            + pr_events["attribution_mcp_tool"],
+        ),
+        kind=pr_events["attribution_skill"].notna().map({True: "Skill", False: "MCP tool"}),
+    )
+    tagged = tagged[tagged["via"].notna()]
+    if not tagged.empty:
+        attributed = (
+            tagged.groupby(["kind", "via"], as_index=False)
+            .agg(turns=("total_cost", "size"), cost=("total_cost", "sum"))
+            .sort_values("cost", ascending=False)
+        )
+        st.markdown("**Turns attributed to skills & MCP tools**")
+        st.caption(
+            "Full turn cost, including re-reading the whole context -- compare "
+            "these against each other rather than against the tool cost above."
+        )
+        st.dataframe(
+            attributed, width="stretch", hide_index=True,
+            height=min(240, 36 * len(attributed) + 40),
+            column_config={
+                "kind": st.column_config.TextColumn("Type"),
+                "via": st.column_config.TextColumn("Skill / MCP tool"),
+                "turns": st.column_config.NumberColumn("Turns", format="%d"),
+                "cost": st.column_config.NumberColumn("Cost", format="$%.2f"),
+            },
+        )
+
+
+def _render_tool_context(calls):
+    """How much each tool pulled into the context: the per-call signal, since
+    a result is billed as input on the turns that follow it."""
+    st.subheader("Cost & context by tool")
+    st.caption(
+        "Tool calls aren't billed on their own, so cost is estimated: a result is paid for "
+        "as a cache write on the next turn, then re-read from cache on every later turn in "
+        "the same context until it's compacted; plus writing the call's input (output "
+        f"tokens). Token counts are estimated from text length (\u00f7 {CHARS_PER_TOKEN_EST}; "
+        "images counted separately and not priced). Big results early in long sessions "
+        "cost far more than their size suggests."
+    )
+
+    has_cost = calls["est_cost"].notna().any()
+    left, right = st.columns([3, 2])
+    with left:
+        group_by = st.segmented_control(
+            "Group by", ["Tool", "MCP server", "Built-in vs MCP"], default="Tool",
+            key="tools-group-by", label_visibility="collapsed",
+        ) or "Tool"
+    with right:
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            measure = st.segmented_control(
+                "Measure", ["Est. cost", "Est. tokens"],
+                default="Est. cost" if has_cost else "Est. tokens",
+                key="tools-measure", label_visibility="collapsed",
+                disabled=not has_cost,
+            ) or "Est. cost"
+    if not has_cost:
+        measure = "Est. tokens"
+        st.caption("Cost estimates appear after the next ingest run (schema v3).")
+    grouped = calls.copy()
+    if group_by == "Tool":
+        grouped["group"] = _tool_labels(grouped)
+    elif group_by == "MCP server":
+        grouped = grouped[grouped["mcp_server"].notna()]
+        grouped["group"] = grouped["mcp_server"]
+    else:
+        grouped["group"] = grouped["mcp_server"].notna().map({True: "MCP", False: "Built-in"})
+    if grouped.empty:
+        st.info("No MCP tool calls in the current filter.")
+        return
+
+    sort_key = "est_cost" if measure == "Est. cost" else "est_tokens"
+    table = _summarize_tools(grouped, sort_key)
+
+    top = table.head(15)
+    if measure == "Est. cost":
+        # Stacked by component: re-reads usually dominate, which is the point.
+        parts = top.melt(
+            id_vars="group", value_vars=["reread_cost", "write_cost", "input_cost"],
+            var_name="part", value_name="cost",
+        )
+        parts["part"] = parts["part"].map({
+            "reread_cost": "Re-reads", "write_cost": "Cache write", "input_cost": "Call input",
+        })
+        fig = px.bar(
+            parts, x="cost", y="group", color="part", orientation="h",
+            category_orders={"group": top["group"].tolist(),
+                             "part": ["Re-reads", "Cache write", "Call input"]},
+            color_discrete_sequence=[ACCENT, ACCENT_MAGENTA, LAVENDER_TINT],
+            labels={"cost": "Est. cost ($)", "group": "", "part": ""},
+        )
+        style_axes(fig)
+        fig.update_layout(
+            height=max(220, 28 * len(top) + 90), margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+        fig.update_xaxes(tickprefix="$")
+    else:
+        fig = _hbar(top, "est_tokens", "group", "Est. tokens returned")
+    st.plotly_chart(fig, width="stretch")
+
+    cost_columns = ["est_cost", "share", "avg_cost", "avg_rereads"] if has_cost else ["share"]
+    st.dataframe(
+        table[["group", "calls", "errors", *cost_columns, "est_tokens", "avg_tokens", "largest", "images"]],
+        width="stretch", height=320, hide_index=True,
+        column_config={
+            "group": st.column_config.TextColumn(group_by),
+            "calls": st.column_config.NumberColumn("Calls", format="%d"),
+            "errors": st.column_config.NumberColumn("Errors", format="%d"),
+            "est_cost": st.column_config.NumberColumn(
+                "Est. cost", format="$%.2f",
+                help="Cache write on the next turn + re-reads until compaction + writing the call's input.",
+            ),
+            "share": st.column_config.ProgressColumn(
+                f"Share of {measure.lower()}", format="%.0f%%", min_value=0, max_value=100,
+            ),
+            "avg_cost": st.column_config.NumberColumn("Avg cost / call", format="$%.4f"),
+            "avg_rereads": st.column_config.NumberColumn(
+                "Avg re-reads", format="%.0f",
+                help="Later turns in the same context that re-read the result from cache.",
+            ),
+            "est_tokens": st.column_config.NumberColumn("Est. tokens", format="%d"),
+            "avg_tokens": st.column_config.NumberColumn("Avg tokens / call", format="%d"),
+            "largest": st.column_config.NumberColumn("Largest", format="%d"),
+            "images": st.column_config.NumberColumn("Images", format="%d"),
+        },
+    )
+
+
+def _render_attribution(df):
+    """Cost of turns Claude Code attributed to an MCP tool or an active skill."""
+    st.subheader("Turns attributed to skills & MCP tools")
+    tagged = df[df["attribution_skill"].notna() | df["attribution_mcp_tool"].notna()]
+    coverage = len(tagged) / len(df) * 100 if len(df) else 0
+    st.caption(
+        f"{len(tagged):,} of {len(df):,} turns ({coverage:.0f}%) carry attribution. Claude Code "
+        "tags a turn with the skill that was active, or with the MCP tool whose result it "
+        "was reading; only recent versions (~2.1.232+) record this, so older history is "
+        "untagged. A turn's cost includes re-reading the whole context, so these totals "
+        "overstate what the skill or tool itself added -- compare them relative to each "
+        "other, not as marginal cost."
+    )
+    if tagged.empty:
+        st.info("No attributed turns in the current filter.")
+        return
+
+    def summarize(frame, key):
+        return (
+            frame.groupby(key, as_index=False)
+            .agg(turns=("total_cost", "size"), cost=("total_cost", "sum"),
+                 sessions=("session_id", "nunique"))
+            .assign(avg_cost=lambda t: t["cost"] / t["turns"])
+            .sort_values("cost", ascending=False)
+        )
+
+    config = {
+        "turns": st.column_config.NumberColumn("Turns", format="%d"),
+        "cost": st.column_config.NumberColumn("Cost", format="$%.2f"),
+        "avg_cost": st.column_config.NumberColumn("Avg / turn", format="$%.3f"),
+        "sessions": st.column_config.NumberColumn("Sessions", format="%d"),
+    }
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**By skill**")
+        skills = tagged[tagged["attribution_skill"].notna()]
+        if skills.empty:
+            st.caption("No skill-attributed turns.")
+        else:
+            table = summarize(skills, "attribution_skill")
+            st.dataframe(
+                table[["attribution_skill", "turns", "cost", "avg_cost", "sessions"]],
+                width="stretch", height=300, hide_index=True,
+                column_config={"attribution_skill": st.column_config.TextColumn("Skill"), **config},
+            )
+    with right:
+        st.markdown("**By MCP tool**")
+        mcp = tagged[tagged["attribution_mcp_tool"].notna()].copy()
+        if mcp.empty:
+            st.caption("No MCP-attributed turns.")
+        else:
+            mcp["mcp"] = mcp["attribution_mcp_server"].fillna("?") + " \u00b7 " + mcp["attribution_mcp_tool"]
+            table = summarize(mcp, "mcp")
+            st.dataframe(
+                table[["mcp", "turns", "cost", "avg_cost", "sessions"]],
+                width="stretch", height=300, hide_index=True,
+                column_config={"mcp": st.column_config.TextColumn("MCP tool"), **config},
+            )
+
+
+def tab_tools(df, calls):
+    if calls.empty and df["attribution_skill"].isna().all() and df["attribution_mcp_tool"].isna().all():
+        st.info(
+            "No tool data yet. It's collected by the ingest job from schema v2 onward -- "
+            "use the refresh button (top right) to run it now."
+        )
+        return
+
+    if not calls.empty:
+        mcp_calls = calls["mcp_server"].notna()
+        tool_cost = calls["est_cost"].sum()
+        spend = df["total_cost"].sum()
+        mcp_cost = calls.loc[mcp_calls, "est_cost"].sum()
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Tool calls", f"{len(calls):,}")
+        c2.metric("MCP calls", f"{mcp_calls.sum():,}")
+        if calls["est_cost"].notna().any():
+            c3.metric(
+                "Est. tool cost", f"${tool_cost:,.2f}",
+                help="Estimated share of spend caused by tool results and calls in this range.",
+            )
+            c4.metric("Share of spend", f"{tool_cost / spend * 100:.0f}%" if spend else "\u2013")
+            c5.metric("Est. MCP cost", f"${mcp_cost:,.2f}")
+        else:
+            c3.metric("Est. tokens returned", f"{calls['result_tokens_est'].sum():,}")
+            c4.metric("Error rate", f"{calls['is_error'].mean() * 100:.1f}%")
+        _render_tool_context(calls)
+    else:
+        st.info("No tool calls in the current filter.")
+
+    st.divider()
+    _render_attribution(df)
 
 
 def tab_trends(df):
@@ -2236,20 +2692,23 @@ def main():
     # Ranked from the FULL history, not the filtered slice -- see
     # build_model_color_map's docstring for why that matters.
     top_models, model_color_map = build_model_color_map(df_all)
+    tool_calls = filter_tool_calls(load_tool_calls(get_db_mtime()), fmeta)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Overview", "Explore", "Insights", "PRs", "Trends", "Ask"]
+    tab1, tab2, tab3, tab4, tab5, tab_tools_, tab6 = st.tabs(
+        ["Overview", "Explore", "Insights", "PRs", "Trends", "Tools", "Ask"]
     )
     with tab1:
-        tab_overview(df, model_color_map, top_models)
+        tab_overview(df, model_color_map, top_models, tool_calls, fmeta)
     with tab2:
         tab_explore(df)
     with tab3:
         tab_insights(df)
     with tab4:
-        tab_prs(df)
+        tab_prs(df, tool_calls)
     with tab5:
         tab_trends(df)
+    with tab_tools_:
+        tab_tools(df, tool_calls)
     with tab6:
         tab_ask()
 

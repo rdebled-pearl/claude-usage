@@ -15,7 +15,7 @@ import sys
 
 MAX_ROWS = 500
 
-# Column list mirrors ingest.py's usage_events schema exactly -- keep in sync
+# Column lists mirror ingest.py's usage_events/tool_calls schema exactly -- keep in sync
 # if that schema changes, since this is Claude's only description of the
 # table (it never sees the DB schema directly, only this string).
 USAGE_EVENTS_SCHEMA = """
@@ -29,12 +29,36 @@ Table usage_events (one row per Claude Code assistant turn):
   thinking_tokens INTEGER,
   input_price_per_mtok REAL, output_price_per_mtok REAL,
   input_cost REAL, output_cost REAL, cache_write_cost REAL, cache_read_cost REAL,
-  total_cost REAL (sum of the four cost columns; the number to use for "cost" questions)
+  total_cost REAL (sum of the four cost columns; the number to use for "cost" questions),
+  attribution_mcp_server TEXT, attribution_mcp_tool TEXT (nullable; set when Claude Code
+    attributed the turn to an MCP tool, i.e. the turn reading that tool's result),
+  attribution_skill TEXT (nullable; the skill active during the turn).
+  Attribution is only recorded by recent Claude Code versions, so older turns are NULL.
+  A turn's cost includes re-reading the whole context, so attributed cost overstates what
+  the skill/tool itself added.
+
+Table tool_calls (one row per tool invocation):
+  tool_use_id TEXT primary key, message_id TEXT (the usage_events turn that made the call),
+  session_id TEXT, date TEXT, timestamp TEXT, model TEXT, repo TEXT, is_subagent INTEGER,
+  tool_name TEXT (e.g. 'Bash', 'Read', 'mcp__clickup__clickup_get_task'),
+  mcp_server TEXT, mcp_tool TEXT (nullable; parsed from mcp__<server>__<tool> names),
+  skill TEXT (nullable; the skill name for tool_name = 'Skill'),
+  input_chars INTEGER, result_chars INTEGER, result_images INTEGER,
+  result_tokens_est INTEGER (result_chars / 4 -- an estimate; tool calls aren't billed
+    separately, their results become input tokens on the following turns),
+  is_error INTEGER, agent_id TEXT (subagent the call ran in; NULL for the main session),
+  est_input_cost REAL, est_write_cost REAL, est_reread_cost REAL, est_cost REAL (USD,
+    ESTIMATES: writing the call input + caching its result on the next turn + re-reading
+    it on each later turn until compaction; est_cost is the sum -- use it for "tool cost"),
+  rereads INTEGER (later turns that re-read the result)
+
+Table context_resets (compaction points): session_id TEXT, agent_id TEXT ('' = main
+  session), timestamp TEXT
 """
 
 RUN_SQL_DESCRIPTION = (
     "Run a read-only SQL query against the usage_events table and return the "
-    "results as JSON. Pass a single SELECT (or WITH ... SELECT) statement; no "
+    "results as JSON. Tables: usage_events, tool_calls, context_resets. Pass a single SELECT (or WITH ... SELECT) statement; no "
     "INSERT/UPDATE/DELETE/DDL and no multiple statements."
 )
 

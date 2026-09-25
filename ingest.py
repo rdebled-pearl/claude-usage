@@ -138,10 +138,57 @@ CREATE TABLE IF NOT EXISTS usage_events (
     output_cost REAL,
     cache_write_cost REAL,
     cache_read_cost REAL,
-    total_cost REAL
+    total_cost REAL,
+    attribution_mcp_server TEXT,
+    attribution_mcp_tool TEXT,
+    attribution_skill TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_date ON usage_events(date);
 CREATE INDEX IF NOT EXISTS idx_usage_events_repo ON usage_events(repo);
+
+-- One row per tool invocation (tool_use block), with the size of what it
+-- returned. A call's own cost isn't billed separately: its result becomes
+-- input on the following turn(s), so result size is the per-call signal.
+CREATE TABLE IF NOT EXISTS tool_calls (
+    tool_use_id TEXT PRIMARY KEY,
+    message_id TEXT,
+    session_id TEXT,
+    date TEXT,
+    timestamp TEXT,
+    model TEXT,
+    repo TEXT,
+    is_subagent INTEGER NOT NULL DEFAULT 0,
+    tool_name TEXT NOT NULL,
+    mcp_server TEXT,
+    mcp_tool TEXT,
+    skill TEXT,
+    input_chars INTEGER DEFAULT 0,
+    result_chars INTEGER,
+    result_images INTEGER,
+    result_tokens_est INTEGER,
+    is_error INTEGER,
+    agent_id TEXT,
+    -- Estimated cost of the call, recomputed after every ingest (see
+    -- compute_tool_costs): writing the tool input (output tokens), the cache
+    -- write of the result on the next turn, and re-reading it on every later
+    -- turn in the same context until a compaction.
+    est_input_cost REAL,
+    est_write_cost REAL,
+    est_reread_cost REAL,
+    est_cost REAL,
+    rereads INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_date ON tool_calls(date);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_tool ON tool_calls(tool_name);
+
+-- Compaction points (system/compact_boundary): the context is replaced by a
+-- summary, so earlier tool results stop being re-read after this.
+CREATE TABLE IF NOT EXISTS context_resets (
+    session_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL DEFAULT '',
+    timestamp TEXT NOT NULL,
+    PRIMARY KEY (session_id, agent_id, timestamp)
+);
 
 CREATE TABLE IF NOT EXISTS ingest_state (
     file_path TEXT PRIMARY KEY,
@@ -189,9 +236,39 @@ def _migrate_to_1(conn):
     })
 
 
+def _migrate_to_2(conn):
+    """Tool/skill attribution columns + the tool_calls table (created by
+    SCHEMA). Rewinds every file's read offset so the next ingest re-reads
+    history to backfill them; usage rows are deduped by message_id, so the
+    re-read doesn't double-count."""
+    _add_columns(conn, "usage_events", {
+        "attribution_mcp_server": "TEXT",
+        "attribution_mcp_tool": "TEXT",
+        "attribution_skill": "TEXT",
+    })
+    conn.execute("UPDATE ingest_state SET byte_offset = 0")
+
+
+def _migrate_to_3(conn):
+    """Per-call cost estimate columns, the subagent a call ran in, and the
+    context_resets table (created by SCHEMA). Rewinds offsets again so the
+    re-read backfills agent_id and compaction points."""
+    _add_columns(conn, "tool_calls", {
+        "agent_id": "TEXT",
+        "est_input_cost": "REAL",
+        "est_write_cost": "REAL",
+        "est_reread_cost": "REAL",
+        "est_cost": "REAL",
+        "rereads": "INTEGER",
+    })
+    conn.execute("UPDATE ingest_state SET byte_offset = 0")
+
+
 # version number -> function that upgrades a DB from (version-1) to (version).
 MIGRATIONS = {
     1: _migrate_to_1,
+    2: _migrate_to_2,
+    3: _migrate_to_3,
 }
 SCHEMA_VERSION = max(MIGRATIONS)
 
@@ -312,6 +389,180 @@ def load_agent_meta(jsonl_path):
         return {}
 
 
+# Rough chars-per-token for tool output (mixed prose/code/JSON). Transcripts
+# don't carry per-result token counts, so result_tokens_est is an estimate.
+CHARS_PER_TOKEN = 4
+
+
+def split_mcp_name(tool_name):
+    """'mcp__<server>__<tool>' -> (server, tool); (None, None) otherwise."""
+    if not tool_name or not tool_name.startswith("mcp__"):
+        return None, None
+    server, sep, tool = tool_name[len("mcp__"):].partition("__")
+    return (server, tool) if sep else (server, None)
+
+
+def measure_tool_result(content):
+    """(text_chars, image_count) for a tool_result's content, which is a
+    string or a list of text/image/tool_reference blocks."""
+    if isinstance(content, str):
+        return len(content), 0
+    chars = images = 0
+    for block in content if isinstance(content, list) else []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            chars += len(block.get("text") or "")
+        elif block.get("type") == "image":
+            images += 1
+        else:
+            chars += len(json.dumps(block))
+    return chars, images
+
+
+def record_tool_uses(conn, obj, message, local_date, repo, is_subagent):
+    for block in message.get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != "tool_use" or not block.get("id"):
+            continue
+        name = block.get("name") or ""
+        tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+        server, tool = split_mcp_name(name)
+        agent_id = obj.get("agentId") if is_subagent else None
+        conn.execute(
+            """INSERT OR IGNORE INTO tool_calls
+               (tool_use_id, message_id, session_id, date, timestamp, model, repo,
+                is_subagent, tool_name, mcp_server, mcp_tool, skill, input_chars, agent_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                block["id"], message.get("id"), obj.get("sessionId"), local_date,
+                obj.get("timestamp"), message.get("model"), repo,
+                1 if is_subagent else 0, name, server, tool,
+                tool_input.get("skill") if name == "Skill" else None,
+                len(json.dumps(tool_input)), agent_id,
+            ),
+        )
+        # Rows from before agent_id existed: fill it in on the backfill re-read.
+        if agent_id:
+            conn.execute(
+                "UPDATE tool_calls SET agent_id = ? WHERE tool_use_id = ? AND agent_id IS NULL AND is_subagent = 1",
+                (agent_id, block["id"]),
+            )
+
+
+def record_context_reset(conn, obj, is_subagent):
+    if obj.get("sessionId") and obj.get("timestamp"):
+        conn.execute(
+            "INSERT OR IGNORE INTO context_resets (session_id, agent_id, timestamp) VALUES (?, ?, ?)",
+            (obj["sessionId"], (obj.get("agentId") or "") if is_subagent else "", obj["timestamp"]),
+        )
+
+
+def compute_tool_costs(conn):
+    """Estimate each tool call's cost and store it on tool_calls.
+
+    A call isn't billed on its own. Its result becomes new input on the next
+    turn in the same context (a cache write at that turn's rate: 2x input for
+    the 1h cache, 1.25x for 5m, 1x if uncached), and is then re-read from
+    cache (0.1x input) on every later turn until a compaction replaces the
+    context. The call's input was generated as output on the issuing turn.
+    All token counts are the chars/CHARS_PER_TOKEN estimates. Recomputed in
+    full each run (cheap) because re-read cost keeps growing while a session
+    continues.
+    """
+    from bisect import bisect_right
+
+    resets = {}
+    for session_id, agent_id, ts in conn.execute(
+        "SELECT session_id, agent_id, timestamp FROM context_resets ORDER BY timestamp"
+    ):
+        resets.setdefault((session_id, agent_id), []).append(ts)
+
+    # Per context: turns in time order, with the segment (compactions so far)
+    # each falls in and the suffix sum of re-read rates within its segment.
+    contexts = {}
+    output_price = {}
+    for (session_id, agent_id, ts, message_id, in_price, out_price, c1h, c5m) in conn.execute(
+        """SELECT session_id, COALESCE(agent_id, ''), timestamp, message_id,
+                  input_price_per_mtok, output_price_per_mtok,
+                  cache_creation_1h_tokens, cache_creation_5m_tokens
+           FROM usage_events ORDER BY timestamp"""
+    ):
+        output_price[message_id] = out_price
+        ctx = contexts.setdefault((session_id, agent_id), {"ts": [], "turns": []})
+        ctx["ts"].append(ts)
+        write_mult = (CACHE_WRITE_1H_MULTIPLIER if c1h else
+                      CACHE_WRITE_5M_MULTIPLIER if c5m else 1.0)
+        ctx["turns"].append([in_price, write_mult, 0, 0.0, 0])  # price, mult, seg, suffix, count
+    for key, ctx in contexts.items():
+        ctx_resets = resets.get(key, [])
+        turns = ctx["turns"]
+        for i, ts in enumerate(ctx["ts"]):
+            turns[i][2] = bisect_right(ctx_resets, ts)
+        suffix, count, seg = 0.0, 0, None
+        for turn in reversed(turns):
+            if turn[2] != seg:
+                suffix, count, seg = 0.0, 0, turn[2]
+            if turn[0] is not None:
+                suffix += turn[0] * CACHE_READ_MULTIPLIER
+                count += 1
+            turn[3], turn[4] = suffix, count
+
+    updates = []
+    for (tool_use_id, session_id, agent_id, ts, tokens, input_chars, message_id) in conn.execute(
+        """SELECT tool_use_id, session_id, COALESCE(agent_id, ''), timestamp,
+                  result_tokens_est, input_chars, message_id FROM tool_calls"""
+    ).fetchall():
+        out_price = output_price.get(message_id)
+        input_cost = (
+            -(-(input_chars or 0) // CHARS_PER_TOKEN) * out_price / 1e6
+            if out_price is not None else None
+        )
+        write_cost = reread_cost = None
+        rereads = 0
+        ctx = contexts.get((session_id, agent_id))
+        if tokens is not None and ctx and ts:
+            ctx_resets = resets.get((session_id, agent_id), [])
+            call_seg = bisect_right(ctx_resets, ts)
+            j = bisect_right(ctx["ts"], ts)  # first turn after the call = reads its result
+            write_cost = reread_cost = 0.0
+            if j < len(ctx["turns"]) and ctx["turns"][j][2] == call_seg and ctx["turns"][j][0] is not None:
+                price, mult = ctx["turns"][j][0], ctx["turns"][j][1]
+                write_cost = tokens * price * mult / 1e6
+                if j + 1 < len(ctx["turns"]) and ctx["turns"][j + 1][2] == call_seg:
+                    reread_cost = tokens * ctx["turns"][j + 1][3] / 1e6
+                    rereads = ctx["turns"][j + 1][4]
+        parts = [c for c in (input_cost, write_cost, reread_cost) if c is not None]
+        updates.append((
+            input_cost, write_cost, reread_cost, sum(parts) if parts else None, rereads,
+            tool_use_id,
+        ))
+    conn.executemany(
+        """UPDATE tool_calls SET est_input_cost = ?, est_write_cost = ?,
+               est_reread_cost = ?, est_cost = ?, rereads = ? WHERE tool_use_id = ?""",
+        updates,
+    )
+
+
+def record_tool_results(conn, obj):
+    """Attach result size/error to the matching tool_calls row. Results always
+    follow their tool_use in the transcript, so the row already exists (even
+    when the two land in different ingest runs)."""
+    content = (obj.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        chars, images = measure_tool_result(block.get("content"))
+        conn.execute(
+            """UPDATE tool_calls SET result_chars = ?, result_images = ?,
+                   result_tokens_est = ?, is_error = ?
+               WHERE tool_use_id = ?""",
+            (chars, images, -(-chars // CHARS_PER_TOKEN),
+             1 if block.get("is_error") else 0, block.get("tool_use_id")),
+        )
+
+
 def ingest_file(conn, path, is_subagent=False, agent_type=None, agent_description=None):
     row = conn.execute(
         "SELECT byte_offset FROM ingest_state WHERE file_path = ?", (path,)
@@ -343,6 +594,12 @@ def ingest_file(conn, path, is_subagent=False, agent_type=None, agent_descriptio
                 break  # incomplete trailing line (write in progress)
             new_offset = line_end
 
+            if obj.get("type") == "user":
+                record_tool_results(conn, obj)
+                continue
+            if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+                record_context_reset(conn, obj, is_subagent)
+                continue
             if obj.get("type") != "assistant":
                 continue
             message = obj.get("message") or {}
@@ -421,6 +678,22 @@ def ingest_file(conn, path, is_subagent=False, agent_type=None, agent_descriptio
             )
             if conn.total_changes > before:
                 inserted += 1
+
+            # A turn tagged by Claude Code as driven by an MCP tool (the turn
+            # reading that tool's result) or by an active skill. Filled in
+            # separately so re-reading history backfills rows ingested before
+            # these columns existed.
+            attribution = (obj.get("attributionMcpServer"), obj.get("attributionMcpTool"),
+                           obj.get("attributionSkill"))
+            if any(attribution):
+                conn.execute(
+                    """UPDATE usage_events SET attribution_mcp_server = ?,
+                           attribution_mcp_tool = ?, attribution_skill = ?
+                       WHERE message_id = ? AND attribution_mcp_server IS NULL
+                         AND attribution_mcp_tool IS NULL AND attribution_skill IS NULL""",
+                    (*attribution, message_id),
+                )
+            record_tool_uses(conn, obj, message, local_date, repo, is_subagent)
 
     conn.execute(
         """INSERT INTO ingest_state (file_path, byte_offset) VALUES (?, ?)
@@ -586,6 +859,10 @@ def main(argv=None):
         )
         write_progress(0.8 * files_seen / total_files,
                        f"Parsing transcripts ({files_seen}/{total_files})")
+    conn.commit()
+
+    write_progress(0.81, "Estimating tool costs\u2026")
+    compute_tool_costs(conn)
     conn.commit()
 
     write_progress(0.82, "Resolving pull requests\u2026")
