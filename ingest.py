@@ -703,6 +703,10 @@ def ingest_file(conn, path, is_subagent=False, agent_type=None, agent_descriptio
     return inserted
 
 
+# Branches that never carry a single PR's work.
+NON_PR_BRANCHES = {"HEAD", "main", "master", "develop"}
+
+
 def lookup_pr(cwd, branch):
     """(number, url) for the PR on this branch, via `gh` -- more reliable
     than reconstructing owner/repo from the local path."""
@@ -747,9 +751,20 @@ def enrich_prs(conn, progress=None):
     if not GH_BIN:
         log("warning: `gh` CLI not found; skipping PR resolution")
         return
+    # `gh pr list --head main` matches any PR whose head branch is named
+    # main (forks, unrelated repos), so shared trunk branches are never
+    # attributed. Also undo attributions made before this guard existed.
+    skip = sorted(NON_PR_BRANCHES)
+    marks = ",".join("?" * len(skip))
+    conn.execute(
+        f"UPDATE usage_events SET pr_number = NULL, pr_url = NULL "
+        f"WHERE pr_number IS NOT NULL AND branch IN ({marks})", skip,
+    )
+    conn.execute(f"DELETE FROM pr_cache WHERE branch IN ({marks})", skip)
     rows = conn.execute(
-        """SELECT DISTINCT repo, branch, cwd FROM usage_events
-           WHERE pr_number IS NULL AND branch IS NOT NULL AND branch != 'HEAD'"""
+        f"""SELECT DISTINCT repo, branch, cwd FROM usage_events
+            WHERE pr_number IS NULL AND repo IS NOT NULL
+              AND branch IS NOT NULL AND branch NOT IN ({marks})""", skip,
     ).fetchall()
     total = len(rows) or 1
     checked = 0

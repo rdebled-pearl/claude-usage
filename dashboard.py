@@ -188,6 +188,17 @@ def load_data(db_mtime):
     df["date"] = pd.to_datetime(df["date"])
     df["total_cost"] = df["total_cost"].fillna(0.0)
     df["is_subagent"] = df["is_subagent"].fillna(0).astype(bool)
+    # groupby drops NaN keys, which would make per-repo views not sum to the
+    # hero total; give those events a visible bucket instead.
+    df["repo"] = df["repo"].fillna("(unknown)")
+    # A session can touch several repos (cd between them). Per-session views
+    # label it by the repo with the most events so each session is one row.
+    primary_repo = (
+        df.groupby(["session_id", "repo"]).size().reset_index(name="n")
+        .sort_values("n", ascending=False).drop_duplicates("session_id")
+        .set_index("session_id")["repo"]
+    )
+    df["session_repo"] = df["session_id"].map(primary_repo)
 
     # timestamp is stored as raw UTC; convert to local tz so hour-of-day
     # reflects wall-clock time, not UTC.
@@ -738,8 +749,10 @@ def filter_bar(df):
         # latest day with data, so an idle day shows as empty.
         start = end = dt.date.today()
     elif preset in preset_days:
-        start = max_date - pd.Timedelta(days=preset_days[preset])
-        end = max_date
+        # Rolling window ending today (inclusive), not the latest day with
+        # data, so a long idle stretch shows as empty rather than stale.
+        end = dt.date.today()
+        start = end - pd.Timedelta(days=preset_days[preset] - 1)
     elif preset == "Custom" and isinstance(custom_range, tuple) and len(custom_range) == 2:
         start, end = custom_range
     else:
@@ -967,8 +980,9 @@ def tab_explore(df):
         .agg(subagent_cost=("total_cost", "sum"), subagent_turns=("total_cost", "count"))
     )
     sessions = (
-        df.groupby(["session_id", "repo"], as_index=False)
+        df.groupby("session_id", as_index=False)
         .agg(
+            repo=("session_repo", "first"),
             turns=("model", "count"),
             cost=("total_cost", "sum"),
             cache_read_mtok=("cache_read_input_tokens", lambda s: s.sum() / 1e6),
@@ -1467,7 +1481,8 @@ def render_cache_by_repo(df):
 
 def render_worst_cache_sessions(df):
     st.subheader("Sessions with the weakest cache economics")
-    g = df.groupby(["session_id", "repo"], as_index=False).agg(
+    g = df.groupby("session_id", as_index=False).agg(
+        repo=("session_repo", "first"),
         turns=("model", "count"),
         cache_read=("cache_read_input_tokens", "sum"),
         cache_write=("cache_write_tokens", "sum"),
@@ -2479,15 +2494,60 @@ def _run_ingest_with_animation(proc):
     st.rerun()
 
 
+def _backup_db():
+    """Copy usage.db to usage.db.bak-<timestamp> via SQLite's backup API (safe
+    against a concurrent writer). Returns the backup path."""
+    path = f"{DB_PATH}.bak-{dt.datetime.now():%Y%m%d-%H%M%S}"
+    src = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    return path
+
+
 @st.dialog("Settings")
 def _settings_dialog():
     st.markdown("#### Data")
     st.caption("Rebuild the database from your Claude Code transcripts if "
                "it looks corrupted or out of date. This re-scans every "
                "transcript from scratch and can take a while.")
-    if st.button("Purge & rebuild data", use_container_width=True, type="primary"):
+    if _ingest_in_progress():
+        st.info("An ingest is running. Wait for it to finish before rebuilding.")
+        return
+    if not st.session_state.get("confirm_purge"):
+        if st.button("Purge & rebuild data", use_container_width=True, type="primary"):
+            st.session_state["confirm_purge"] = True
+            st.rerun(scope="fragment")
+        return
+    st.warning(
+        "Only transcripts still on disk can be restored. Claude Code deletes "
+        "old transcripts after its retention window, so older history will be "
+        "lost. Everything is also re-priced at today's rates. A backup of the "
+        "current database is saved first."
+    )
+    c_confirm, c_cancel = st.columns(2)
+    if c_cancel.button("Cancel", use_container_width=True):
+        st.session_state.pop("confirm_purge", None)
+        st.rerun(scope="fragment")
+    if c_confirm.button("Yes, purge & rebuild", use_container_width=True, type="primary"):
+        st.session_state.pop("confirm_purge", None)
         try:
-            os.remove(DB_PATH)
+            _backup_db()
+        except sqlite3.Error as exc:
+            st.error(f"Backup failed, so nothing was deleted: {exc}")
+            return
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + suffix)
+            except OSError:
+                pass
+        try:
+            os.remove(PROGRESS_PATH)
         except OSError:
             pass
         load_data.clear()
@@ -2682,7 +2742,10 @@ def main():
 
     df, fmeta = filter_bar(df_all)
     if df.empty:
-        st.info("No events match the current filters.")
+        st.info(
+            "No events match the current filters. "
+            f"Last activity was {df_all['date'].max().date()}."
+        )
         return
 
     prior_df = previous_period(df_all, fmeta)
